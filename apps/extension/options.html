@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChromeLens settings</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main>
+    <header><p>CHROMELENS / LOCAL CONTROLS</p><h1>Privacy is the default.</h1><span>Configure collection before relying on the activity record. Settings remain in extension-local storage.</span></header>
+    <form id="settings-form">
+      <section>
+        <div class="section-title"><b>01</b><div><h2>Local collector</h2><p>The collector URL is restricted to loopback. Copy the token shown by <code>npm run dev</code>.</p></div></div>
+        <label>Collector URL<input id="collector-url" type="url" required></label>
+        <label>Bearer token<input id="token" type="password" autocomplete="off"></label>
+        <label>Browser profile label<input id="profile-id" type="text" placeholder="chrome:Default"></label>
+        <button id="test-collector" type="button" class="secondary">Test connection</button>
+      </section>
+      <section>
+        <div class="section-title"><b>02</b><div><h2>Redaction</h2><p>Rules run before queueing and again in the collector.</p></div></div>
+        <label>Query-string values<select id="query-redaction"><option value="all">Redact all values</option><option value="sensitive">Redact sensitive keys</option><option value="none">Keep non-sensitive values</option></select></label>
+        <label class="check"><input id="remove-fragments" type="checkbox"><span>Remove URL fragments</span></label>
+        <label class="check"><input id="drop-tracking" type="checkbox"><span>Remove known tracking parameters</span></label>
+        <label class="check"><input id="redact-localhost" type="checkbox"><span>Hide localhost paths</span></label>
+        <label class="check warning"><input id="allow-incognito" type="checkbox"><span>Allow incognito metadata when Chrome also enables this extension in incognito</span></label>
+      </section>
+      <section>
+        <div class="section-title"><b>03</b><div><h2>Exclusions</h2><p>One entry per line. Subdomains inherit a domain exclusion.</p></div></div>
+        <label>Excluded domains<textarea id="excluded-domains" rows="8"></textarea></label>
+        <label>Excluded URL patterns<textarea id="excluded-patterns" rows="6"></textarea></label>
+      </section>
+      <footer><button type="submit" class="primary">Save local settings</button><p id="feedback" aria-live="polite"></p></footer>
+    </form>
+  </main>
+  <script type="module" src="options.js"></script>
+</body>
+</html>

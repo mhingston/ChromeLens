@@ -1,0 +1,29 @@
+{
+  "name": "chromelens",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "npm run build && tsx apps/collector/src/cli.ts serve",
+    "start": "node dist/collector/cli.js serve",
+    "profiles": "tsx apps/collector/src/cli.ts profiles",
+    "import": "tsx apps/collector/src/cli.ts import",
+    "outputs": "tsx apps/collector/src/cli.ts outputs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "verify": "npm run typecheck && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.2.2",
+    "@types/node": "^26.1.1",
+    "esbuild": "^0.28.1",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}

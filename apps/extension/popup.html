@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChromeLens</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div class="brand-mark" aria-hidden="true"><span></span></div>
+      <div>
+        <p class="eyebrow">LOCAL ACTIVITY LENS</p>
+        <h1>ChromeLens</h1>
+      </div>
+      <button id="open-options" class="icon-button" aria-label="Open settings">•••</button>
+    </header>
+
+    <section class="status-card">
+      <div id="status-pill" class="status-pill" data-state="active"><i></i><span id="status-label">Tracking active</span></div>
+      <p>Only tab metadata, browser focus, and idle state. Never page content or keystrokes.</p>
+      <button id="toggle-tracking" class="secondary">Pause tracking</button>
+    </section>
+
+    <section class="idea-card">
+      <div class="section-heading">
+        <div><span class="spark">✦</span><h2>Capture an idea</h2></div>
+        <kbd>⌥ ⇧ I</kbd>
+      </div>
+      <label for="idea">Attach a thought to the current page</label>
+      <textarea id="idea" maxlength="10000" placeholder="What clicked while you were browsing?"></textarea>
+      <input id="tags" type="text" placeholder="tags, separated, by commas" aria-label="Idea tags">
+      <button id="capture-idea" class="primary">Capture idea <span>→</span></button>
+      <p id="feedback" class="feedback" aria-live="polite"></p>
+    </section>
+
+    <section class="delivery">
+      <div><span>Queued</span><strong id="queue-count">0</strong></div>
+      <div><span>Dropped</span><strong id="dropped-count">0</strong></div>
+      <button id="retry">Retry now</button>
+    </section>
+    <p id="connection" class="connection">Checking collector…</p>
+    <button id="open-dashboard" class="text-button">Open local dashboard <span>↗</span></button>
+  </main>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChromeLens — local browser activity</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="#day" aria-label="ChromeLens home"><span class="lens"><i></i></span><span><small>LOCAL ACTIVITY</small>ChromeLens</span></a>
+    <nav aria-label="Dashboard views">
+      <button class="nav-button active" data-view="day"><span>◫</span>Day</button>
+      <button class="nav-button" data-view="week"><span>▥</span>Week</button>
+      <button class="nav-button" data-view="month"><span>▦</span>Month</button>
+      <div class="nav-rule"></div>
+      <button class="nav-button" data-view="settings"><span>⚙</span>Privacy & data</button>
+    </nav>
+    <div class="principle"><b>Context, not performance.</b><p>ChromeLens reports observed activity and keeps interpretation separate.</p></div>
+    <div class="local-status"><i></i><span>Local collector</span><strong>127.0.0.1</strong></div>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <div><p class="eyebrow">BROWSING EVIDENCE / <span id="view-kicker">DAILY LENS</span></p><h1 id="view-title">A day in context.</h1></div>
+      <div class="date-controls" id="date-controls"><button id="previous-date" aria-label="Previous period">←</button><input id="date" type="date"><button id="next-date" aria-label="Next period">→</button></div>
+    </header>
+    <div id="notice" class="notice" hidden></div>
+    <section id="content" aria-live="polite"><div class="loading">Focusing the lens…</div></section>
+  </main>
+
+  <dialog id="token-dialog">
+    <form method="dialog" id="token-form">
+      <span class="dialog-mark">◎</span><p class="eyebrow">LOCAL AUTHENTICATION</p><h2>Connect this dashboard.</h2>
+      <p>Paste the bearer token printed when the collector starts. It remains only in this browser's local storage.</p>
+      <label>Collector token<input id="dashboard-token" type="password" autocomplete="off" required autofocus></label>
+      <button class="primary" value="default">Unlock local data</button>
+      <small>Nothing is sent outside this machine.</small>
+    </form>
+  </dialog>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

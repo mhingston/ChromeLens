@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.chromelens/
+coverage/
+*.log
+.DS_Store
