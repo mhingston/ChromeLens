@@ -35,21 +35,30 @@ There is no LLM client. Raw URLs are never transmitted to a third party by defau
 
 ## Setup
 
+ChromeLens is a local-first **Manifest V3 Chrome/Brave extension** backed by a local collector and dashboard. It is not currently distributed through the Chrome Web Store; install the generated extension as an unpacked developer extension.
+
+From a clone of this repository:
+
 ```bash
+git clone https://github.com/mhingston/ChromeLens.git
+cd ChromeLens
 npm install
-npm run verify
+npm run build
 npm run dev
 ```
 
-The collector prints its dashboard URL, extension bearer token, and data path. It binds to `http://127.0.0.1:47832` by default. Set `CHROMELENS_PORT` or `CHROMELENS_DATA_DIR` to change the port or local data directory; the bind address is intentionally not configurable.
+Keep `npm run dev` running. The collector prints its dashboard URL, extension bearer token, and data path. It binds to `http://127.0.0.1:47832` by default. Set `CHROMELENS_PORT` or `CHROMELENS_DATA_DIR` to change the port or local data directory; the bind address is intentionally not configurable.
 
-Open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select:
+Install the extension in Chrome:
+
+1. Open `chrome://extensions` and enable **Developer mode**.
+2. Choose **Load unpacked** and select:
 
 ```text
 <repository>/dist/extension
 ```
 
-Open the extension options, paste the collector token, review exclusions/redaction, and test the connection. Then open the popup: the badge and status card make tracking state visible.
+For Brave, use the same steps at `brave://extensions`. Open the extension options, paste the collector token, review exclusions/redaction, and test the connection. Then open the popup: the badge and status card make tracking state visible.
 
 ## Historical import
 
