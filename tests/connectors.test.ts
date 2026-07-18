@@ -50,6 +50,7 @@ describe("output connectors", () => {
       endedAt,
       topicLabel: "browser evidence",
       topicConfidence: 0.8,
+      topicLabelSource: "deterministic",
       activeDurationMs: 10 * 60_000,
       idleDurationMs: 0,
       uniqueDomains: 2,

@@ -114,4 +114,51 @@ describe("prospective activity derivation", () => {
       { domain: "code.example", durationMs: 2 * 60_000, switches: 0 },
     ]);
   });
+
+  it("does not let an empty pending-navigation URL fragment a same-domain focus period", () => {
+    const intervals = deriveActiveIntervals([
+      event("window_focused", "12:30"),
+      event("tab_activated", "12:30", {
+        tabId: "A", url: "https://github.com/example/repository", canonicalUrl: "https://github.com/example/repository", domain: "github.com",
+      }),
+      event("tab_activated", "12:31", {
+        occurredAt: "2026-07-18T12:31:00.000Z", tabId: "B", url: "", canonicalUrl: null, domain: null, title: "",
+      }),
+      event("url_changed", "12:31", {
+        occurredAt: "2026-07-18T12:31:00.020Z", tabId: "B", url: "https://github.com/example/other", canonicalUrl: "https://github.com/example/other", domain: "github.com",
+      }),
+      event("window_blurred", "12:32"),
+    ]);
+
+    expect(intervals.map((interval) => interval.domain)).toEqual(["github.com", "github.com"]);
+    expect(deriveFocusPeriods(intervals)).toHaveLength(1);
+  });
+
+  it("applies explicit split, merge, and topic-label corrections at stable interval anchors", () => {
+    const interval = (id: string, start: string, end: string, title: string): ActiveInterval => ({
+      intervalId: id, deviceId: "device", browserProfileId: "chrome:Default", browserSessionId: "session", tabId: id,
+      startedAt: `2026-07-18T${start}:00.000Z`, endedAt: `2026-07-18T${end}:00.000Z`,
+      durationMs: Date.parse(`2026-07-18T${end}:00.000Z`) - Date.parse(`2026-07-18T${start}:00.000Z`),
+      url: `https://example.com/${id}`, canonicalUrl: `https://example.com/${id}`, domain: "example.com", title,
+      terminationReason: "tab_activated", derivationVersion: 1,
+    });
+    const intervals = [
+      interval("one", "14:00", "14:05", "Browser research"),
+      interval("two", "14:06", "14:10", "Browser implementation"),
+      interval("three", "15:00", "15:05", "Unrelated topic"),
+    ];
+    const corrected = groupResearchEpisodes(intervals, [], { corrections: [
+      { correctionId: "split", createdAt: "2026-07-18T16:00:00.000Z", correctionType: "split_before", anchorIntervalId: "two", label: null },
+      { correctionId: "merge", createdAt: "2026-07-18T16:01:00.000Z", correctionType: "merge_before", anchorIntervalId: "three", label: null },
+      { correctionId: "rename", createdAt: "2026-07-18T16:02:00.000Z", correctionType: "rename", anchorIntervalId: "two", label: "Implementation trail" },
+    ] });
+
+    expect(corrected).toHaveLength(2);
+    expect(corrected[0]!.intervalIds).toEqual(["one"]);
+    expect(corrected[1]).toMatchObject({
+      intervalIds: ["two", "three"],
+      topicLabel: "Implementation trail",
+      topicLabelSource: "user",
+    });
+  });
 });

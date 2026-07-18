@@ -9,5 +9,6 @@
 | Local database theft or cloud backup | Local-only storage, documented disk-encryption and backup guidance | No application-level database encryption in the initial release |
 | Collector outage | Bounded local queue, idempotent IDs, batching, retry and visible drop count | Queue capacity can be exhausted during a long outage |
 | Chromium schema change | Snapshot first, inspect tables/columns, skip optional fields, report imported fields | A breaking removal of core tables blocks import safely |
-| Malicious title/URL prompt injection | No LLM client; future payloads must structure and delimit observations | User-selected future integrations require a separate review |
+| Malicious title/URL prompt injection | No built-in LLM client; analysis packs use structured records, mark all strings as untrusted data, omit titles/URLs in aggregate mode, and require exact preview before download | A model chosen by the user may still mishandle malicious or misleading strings |
+| Accidental over-sharing through an LLM export | Required date range, aggregate-by-default privacy profile, URL opt-in, token budget, exact preview, and explicit download | Contextual ideas, titles, outputs, and notes may still be sensitive |
 | Incognito collection | Extension rejects incognito tabs by default even if Chrome grants incognito access | Explicit user opt-in intentionally changes this guarantee |

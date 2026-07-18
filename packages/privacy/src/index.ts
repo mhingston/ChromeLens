@@ -56,7 +56,7 @@ export function sanitizeActivityEvent(event: ActivityEvent, settings: PrivacySet
   if (event.incognito && !settings.allowIncognito) {
     return excludedMarker(event, "incognito_disabled");
   }
-  if (!event.url) return { ...event, canonicalUrl: null, domain: null };
+  if (!event.url?.trim()) return { ...event, url: null, canonicalUrl: null, domain: null };
 
   let parsed: URL;
   try {

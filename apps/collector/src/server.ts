@@ -4,11 +4,12 @@ import type { AddressInfo } from "node:net";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { extname, join } from "node:path";
-import { EPISODE_ANNOTATION_LABELS, isActivityEventType, type ActivityEvent, type EpisodeAnnotationLabel } from "../../../packages/domain/src/index.ts";
+import { EPISODE_ANNOTATION_LABELS, isActivityEventType, type ActivityEvent, type EpisodeAnnotationLabel, type EpisodeCorrectionType } from "../../../packages/domain/src/index.ts";
 import { type ActivityStore } from "../../../packages/database/src/index.ts";
 import { defaultPrivacySettings, type PrivacySettings } from "../../../packages/privacy/src/index.ts";
 import { discoverBrowserProfiles, importBrowserHistory } from "../../../packages/browser-history-import/src/index.ts";
 import { GitOutputConnector } from "../../../packages/connectors/src/index.ts";
+import type { AnalysisExportOptions } from "../../../packages/analysis-pack/src/index.ts";
 
 export interface CollectorServerOptions {
   store: ActivityStore;
@@ -126,7 +127,7 @@ async function handleRequest(
       return;
     }
     const report = store.ingestEvents(events, privacySettings);
-    store.rebuildDerivations();
+    if (report.inserted > 0) store.rebuildSessions(events.map((event) => event.browserSessionId));
     json(response, 202, report);
     return;
   }
@@ -136,7 +137,12 @@ async function handleRequest(
       retention: store.getSetting("retention", { mode: "user-controlled", automaticCompaction: false }),
       connectors: { git: store.getSetting("gitConnector", { repositoryPath: "", associationWindowMinutes: 30 }) },
       annotationLabels: EPISODE_ANNOTATION_LABELS,
-      llm: { enabled: false, available: false, message: "No LLM client is included in this release." },
+      llm: {
+        enabled: false,
+        available: false,
+        analysisExportAvailable: true,
+        message: "No model client is included. Preview and export a deliberately selected local analysis pack for an LLM you choose.",
+      },
     });
     return;
   }
@@ -152,19 +158,36 @@ async function handleRequest(
     json(response, 200, { privacy: updated });
     return;
   }
+  if (request.method === "GET" && url.pathname === "/api/export/preview") {
+    try {
+      const artifact = store.createAnalysisExport(parseAnalysisExportOptions(url));
+      json(response, 200, artifact);
+    } catch (error) {
+      json(response, 400, { error: "invalid_analysis_export", message: error instanceof Error ? error.message : "Invalid analysis export" });
+    }
+    return;
+  }
   if (request.method === "GET" && url.pathname === "/api/export") {
-    if ((url.searchParams.get("format") ?? "json") !== "json") {
-      json(response, 400, { error: "unsupported_export", message: "Use format=json" });
+    const format = url.searchParams.get("format") ?? "json";
+    if (format === "json") {
+      response.setHeader("content-disposition", `attachment; filename="chromelens-export-${new Date().toISOString().slice(0, 10)}.json"`);
+      json(response, 200, store.exportData());
       return;
     }
-    response.setHeader("content-disposition", `attachment; filename="chromelens-export-${new Date().toISOString().slice(0, 10)}.json"`);
-    json(response, 200, store.exportData());
+    try {
+      const artifact = store.createAnalysisExport(parseAnalysisExportOptions(url));
+      response.setHeader("content-disposition", `attachment; filename="${artifact.filename}"`);
+      text(response, 200, artifact.content, artifact.mediaType);
+    } catch (error) {
+      json(response, 400, { error: "invalid_analysis_export", message: error instanceof Error ? error.message : "Invalid analysis export" });
+    }
     return;
   }
   if (request.method === "GET" && url.pathname === "/api/summary/daily") {
     const date = url.searchParams.get("date") ?? new Date().toISOString().slice(0, 10);
+    const timeZone = url.searchParams.get("timezone") ?? "UTC";
     try {
-      json(response, 200, store.getDailySummary(date));
+      json(response, 200, store.getDailySummary(date, timeZone));
     } catch (error) {
       json(response, 400, { error: "invalid_date", message: error instanceof Error ? error.message : "Invalid date" });
     }
@@ -173,7 +196,8 @@ async function handleRequest(
   if (request.method === "GET" && url.pathname === "/api/summary/range") {
     const from = url.searchParams.get("from") ?? new Date().toISOString().slice(0, 10);
     const days = Number(url.searchParams.get("days") ?? 7);
-    try { json(response, 200, store.getRangeSummary(from, days)); }
+    const timeZone = url.searchParams.get("timezone") ?? "UTC";
+    try { json(response, 200, store.getRangeSummary(from, days, timeZone)); }
     catch (error) { json(response, 400, { error: "invalid_range", message: error instanceof Error ? error.message : "Invalid range" }); }
     return;
   }
@@ -240,6 +264,32 @@ async function handleRequest(
     } catch (error) {
       json(response, 400, { error: "annotation_failed", message: error instanceof Error ? error.message : "Could not save annotation" });
     }
+    return;
+  }
+  const correctionMatch = /^\/api\/episodes\/([^/]+)\/corrections$/.exec(url.pathname);
+  if (request.method === "POST" && correctionMatch) {
+    const body = await readJson(request);
+    if (!isRecord(body) || typeof body.correctionType !== "string") {
+      json(response, 400, { error: "invalid_episode_correction" });
+      return;
+    }
+    try {
+      const correction = store.addEpisodeCorrection({
+        episodeId: decodeURIComponent(correctionMatch[1]!),
+        correctionType: body.correctionType as EpisodeCorrectionType,
+        ...(typeof body.label === "string" ? { label: body.label } : {}),
+        ...(typeof body.beforeIntervalId === "string" ? { beforeIntervalId: body.beforeIntervalId } : {}),
+      });
+      json(response, 201, correction);
+    } catch (error) {
+      json(response, 400, { error: "episode_correction_failed", message: error instanceof Error ? error.message : "Could not correct episode" });
+    }
+    return;
+  }
+  const correctionDeleteMatch = /^\/api\/episode-corrections\/([^/]+)$/.exec(url.pathname);
+  if (request.method === "DELETE" && correctionDeleteMatch) {
+    const removed = store.removeEpisodeCorrection(decodeURIComponent(correctionDeleteMatch[1]!));
+    json(response, removed ? 200 : 404, removed ? { removed: true } : { error: "episode_correction_not_found" });
     return;
   }
   if (request.method === "POST" && url.pathname === "/api/rebuild") {
@@ -343,6 +393,40 @@ function json(response: ServerResponse, status: number, body: unknown): void {
   if (response.headersSent) return;
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   response.end(JSON.stringify(body));
+}
+
+function text(response: ServerResponse, status: number, body: string, contentType: string): void {
+  if (response.headersSent) return;
+  response.writeHead(status, { "content-type": contentType, "cache-control": "no-store" });
+  response.end(body);
+}
+
+function parseAnalysisExportOptions(url: URL): AnalysisExportOptions {
+  const requestedFormat = url.searchParams.get("format");
+  const format = requestedFormat === "llm-markdown"
+    ? "markdown"
+    : requestedFormat === "llm-jsonl"
+      ? "jsonl"
+      : (() => { throw new Error("Use format=llm-markdown or format=llm-jsonl"); })();
+  const privacy = url.searchParams.get("privacy") ?? "aggregate";
+  if (privacy !== "aggregate" && privacy !== "contextual" && privacy !== "detailed") {
+    throw new Error("privacy must be aggregate, contextual, or detailed");
+  }
+  const maxTokens = Number(url.searchParams.get("maxTokens") ?? 50_000);
+  return {
+    from: requiredQueryParameter(url, "from"),
+    to: requiredQueryParameter(url, "to"),
+    timeZone: requiredQueryParameter(url, "timezone"),
+    privacy,
+    format,
+    maxTokens,
+  };
+}
+
+function requiredQueryParameter(url: URL, name: string): string {
+  const value = url.searchParams.get(name);
+  if (!value) throw new Error(`${name} is required`);
+  return value;
 }
 
 function requiredString(value: unknown, name: string, maximum = 1_000): string {

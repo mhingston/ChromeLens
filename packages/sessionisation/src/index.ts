@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { ActiveInterval, ActivityEvent, CapturedIdea, FocusPeriod, ResearchEpisode } from "../../domain/src/index.ts";
+import type { ActiveInterval, ActivityEvent, CapturedIdea, EpisodeCorrection, FocusPeriod, ResearchEpisode } from "../../domain/src/index.ts";
 
 interface PageState {
   tabId: string | null;
@@ -135,7 +135,8 @@ function isEligible(state: BrowserState): boolean {
     && state.tracking
     && !state.page.excluded
     && state.page.tabId !== null
-    && state.page.url !== null;
+    && typeof state.page.url === "string"
+    && state.page.url.trim().length > 0;
 }
 
 function pageKey(page: PageState): string {
@@ -212,16 +213,20 @@ export function deriveFocusPeriods(intervals: ActiveInterval[], toleranceMs = 60
 export function groupResearchEpisodes(
   intervals: ActiveInterval[],
   ideas: CapturedIdea[] = [],
-  gapMs = 30 * 60_000,
+  options: { gapMs?: number; corrections?: EpisodeCorrection[] } = {},
 ): ResearchEpisode[] {
+  const gapMs = options.gapMs ?? 30 * 60_000;
+  const corrections = options.corrections ?? [];
+  const splitAnchors = new Set(corrections.filter((correction) => correction.correctionType === "split_before").map((correction) => correction.anchorIntervalId));
+  const mergeAnchors = new Set(corrections.filter((correction) => correction.correctionType === "merge_before").map((correction) => correction.anchorIntervalId));
   const ordered = [...intervals].sort((left, right) => left.startedAt.localeCompare(right.startedAt));
   const groups: ActiveInterval[][] = [];
   for (const interval of ordered) {
     const current = groups.at(-1);
-    if (!current || !belongsToEpisode(interval, current, gapMs)) groups.push([interval]);
+    if (!current || splitAnchors.has(interval.intervalId) || (!mergeAnchors.has(interval.intervalId) && !belongsToEpisode(interval, current, gapMs))) groups.push([interval]);
     else current.push(interval);
   }
-  return groups.map((group) => buildEpisode(group, ideas));
+  return groups.map((group) => buildEpisode(group, ideas, corrections));
 }
 
 function belongsToEpisode(candidate: ActiveInterval, current: ActiveInterval[], gapMs: number): boolean {
@@ -233,7 +238,7 @@ function belongsToEpisode(candidate: ActiveInterval, current: ActiveInterval[], 
   return intervalTerms(candidate).some((term) => currentTerms.has(term));
 }
 
-function buildEpisode(intervals: ActiveInterval[], ideas: CapturedIdea[]): ResearchEpisode {
+function buildEpisode(intervals: ActiveInterval[], ideas: CapturedIdea[], corrections: EpisodeCorrection[]): ResearchEpisode {
   const first = intervals[0]!;
   const last = intervals.at(-1)!;
   const startedAt = first.startedAt;
@@ -245,7 +250,12 @@ function buildEpisode(intervals: ActiveInterval[], ideas: CapturedIdea[]): Resea
     .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
     .slice(0, 2)
     .map(([term]) => term);
-  const topicLabel = topicTerms.join(" ") || domains[0] || "unlabelled research";
+  const deterministicTopicLabel = topicTerms.join(" ") || domains[0] || "unlabelled research";
+  const intervalIds = new Set(intervals.map((interval) => interval.intervalId));
+  const rename = [...corrections]
+    .filter((correction) => correction.correctionType === "rename" && correction.label && intervalIds.has(correction.anchorIntervalId))
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+  const topicLabel = rename?.label ?? deterministicTopicLabel;
   const sharedTerms = [...termCounts.entries()].filter(([, count]) => count > 1).map(([term]) => term).sort();
   const relatedIdeas = ideas.filter((idea) => idea.capturedAt >= startedAt && idea.capturedAt <= endedAt);
   const activeDurationMs = intervals.reduce((sum, interval) => sum + interval.durationMs, 0);
@@ -253,12 +263,14 @@ function buildEpisode(intervals: ActiveInterval[], ideas: CapturedIdea[]): Resea
   if (sharedTerms.length) evidence.push(`Grouped by shared title terms: ${sharedTerms.join(", ")}.`);
   if (new Set(domains).size < domains.length) evidence.push("Grouped by a repeated domain.");
   if (relatedIdeas.length) evidence.push(`${relatedIdeas.length} explicitly captured idea(s) occurred during the episode.`);
+  if (rename) evidence.push("Topic label set by an explicit user correction.");
   return {
     episodeId: `ep_${createHash("sha256").update(intervals.map((interval) => interval.intervalId).join("\0")).digest("hex").slice(0, 24)}`,
     startedAt,
     endedAt,
     topicLabel,
-    topicConfidence: intervals.length === 0 ? 0 : Math.min(1, (termCounts.get(topicTerms[0] ?? "") ?? 0) / intervals.length),
+    topicConfidence: rename ? 1 : intervals.length === 0 ? 0 : Math.min(1, (termCounts.get(topicTerms[0] ?? "") ?? 0) / intervals.length),
+    topicLabelSource: rename ? "user" : "deterministic",
     activeDurationMs,
     idleDurationMs: Math.max(0, Date.parse(endedAt) - Date.parse(startedAt) - activeDurationMs),
     uniqueDomains: new Set(domains).size,

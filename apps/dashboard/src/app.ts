@@ -1,12 +1,15 @@
+import { countLabel, formatDuration, summarizeEpisodePages, summarizeFocusPeriods, type EpisodeIntervalView, type FocusPeriodView } from "./presentation.ts";
+
 type Json = Record<string, any>;
 
 const content = document.querySelector<HTMLElement>("#content")!;
 const dateInput = document.querySelector<HTMLInputElement>("#date")!;
 const tokenDialog = document.querySelector<HTMLDialogElement>("#token-dialog")!;
 const notice = document.querySelector<HTMLElement>("#notice")!;
+const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 let token = localStorage.getItem("chromelens-token") ?? "";
 let view = "day";
-dateInput.value = new Date().toISOString().slice(0, 10);
+dateInput.value = localCalendarDate(new Date());
 
 document.querySelectorAll<HTMLButtonElement>(".nav-button").forEach((button) => button.addEventListener("click", () => {
   view = button.dataset.view ?? "day";
@@ -34,8 +37,8 @@ async function load(): Promise<void> {
   notice.hidden = true;
   try {
     if (!token) return requireToken();
-    if (view === "day") renderDay(await api(`/api/summary/daily?date=${dateInput.value}`));
-    else if (view === "week" || view === "month") renderRange(await api(`/api/summary/range?from=${dateInput.value}&days=${periodDays()}`));
+    if (view === "day") renderDay(await api(`/api/summary/daily?date=${dateInput.value}&timezone=${encodeURIComponent(timeZone)}`));
+    else if (view === "week" || view === "month") renderRange(await api(`/api/summary/range?from=${dateInput.value}&days=${periodDays()}&timezone=${encodeURIComponent(timeZone)}`));
     else await renderSettings();
   } catch (error) {
     if (error instanceof HttpError && error.status === 401) return requireToken();
@@ -53,7 +56,7 @@ function renderDay(data: Json): void {
     metric("Linked outputs", String(data.metrics.outputCount), "Local connector evidence"),
   );
   const grid = el("section", "grid");
-  grid.append(timelineCard(data), focusCard(data.focusPeriods), boundariesCard(data.boundaries), domainsCard(data.topDomains), episodesCard(data.episodes,data.outputs,data.annotations,data.intervals), ideasCard(data.ideas), outputsCard(data.outputs));
+  grid.append(timelineCard(data), focusCard(data.focusPeriods), boundariesCard(data.boundaries), domainsCard(data.topDomains), episodesCard(data.episodes,data.outputs,data.annotations,data.corrections??[],data.intervals,data.ideas), ideasCard(data.ideas), outputsCard(data.outputs));
   content.replaceChildren(metrics, grid);
   if (!data.intervals.length) showNotice("No prospective activity intervals for this day. Historical visits cannot be presented as active attention.");
 }
@@ -65,9 +68,8 @@ function timelineCard(data: Json): HTMLElement {
   const colors = ["#2d7d68","#c26c35","#55739b","#7c638e","#8a814f","#4e8a8e"];
   const lanes: number[] = [];
   data.intervals.forEach((interval: Json, index: number) => {
-    const start = new Date(interval.startedAt); const end = new Date(interval.endedAt);
-    const startMinute = start.getUTCHours()*60+start.getUTCMinutes()+start.getUTCSeconds()/60;
-    const endMinute = end.getUTCHours()*60+end.getUTCMinutes()+end.getUTCSeconds()/60;
+    const startMinute = minuteWithinCalendarDay(interval.startedAt, data.date, false);
+    const endMinute = minuteWithinCalendarDay(interval.endedAt, data.date, true);
     let lane = lanes.findIndex((last) => last <= startMinute); if (lane < 0) lane = lanes.length; lanes[lane] = endMinute;
     const item = el("button", "time-row", interval.title || interval.domain || "Untitled page");
     item.style.left = `${(startMinute/1440)*100}%`; item.style.width = `${Math.max(.55,((endMinute-startMinute)/1440)*100)}%`; item.style.top = `${lane*39+10}px`; item.style.setProperty("--domain-color", colors[index%colors.length]!);
@@ -81,37 +83,257 @@ function timelineCard(data: Json): HTMLElement {
 function domainsCard(domains: Json[]): HTMLElement {
   const card = cardShell("Top domains", "Ranked by observed foreground duration.");
   if (!domains.length) { card.append(empty("No domains recorded.")); return card; }
-  const list = el("div", "bar-list"); const maximum = domains[0]!.activeDurationMs || 1;
+  const list = scrollRegion(el("div", "bar-list"), "Top domains"); const maximum = domains[0]!.activeDurationMs || 1;
   domains.slice(0,8).forEach((item) => list.append(barRow(item.domain, duration(item.activeDurationMs), item.activeDurationMs/maximum)));
   card.append(list); return card;
 }
 
-function episodesCard(episodes: Json[],outputs:Json[],annotations:Json[],intervals:Json[]): HTMLElement {
-  const card = cardShell("Research episodes", "Deterministic groupings, output associations, and your annotations.");
-  const list = el("div", "episode-list");
-  if (!episodes.length) list.append(empty("No episode evidence for this day."));
-  episodes.forEach((episode) => {
-    const item = el("article", "episode"); const head = el("div", "episode-header");
-    head.append(el("h3", "", episode.topicLabel), el("time", "", `${clock(episode.startedAt)}–${clock(episode.endedAt)}`));
-    const meta = el("div", "episode-meta"); meta.append(el("span","",duration(episode.activeDurationMs)),el("span","",`${episode.uniqueDomains} domains`),el("span","",`${episode.tabSwitchCount} tab switches`),el("span","",`${episode.ideaCount} ideas`),el("span","",`${episode.outputCount} outputs`));
-    const evidence = el("ul", "evidence"); episode.evidence.forEach((value: string) => evidence.append(el("li","",value)));
-    const pages=el("ol","episode-pages");episode.intervalIds.map((id:string)=>intervals.find((interval)=>interval.intervalId===id)).filter(Boolean).forEach((interval:Json)=>pages.append(el("li","",`${clock(interval.startedAt)} ${interval.title||interval.domain||"Private context"} · ${interval.domain||"excluded"}`)));
-    const details:HTMLElement[]=[];const linked=outputs.filter((output)=>output.episodeId===episode.episodeId);if(linked.length){const outputList=el("div","episode-links");linked.forEach((output)=>outputList.append(el("p","",`↗ ${output.title||output.reference||"Local output"} · ${output.associationReason}`)));details.push(outputList)}
-    const existing=annotations.filter((annotation)=>annotation.episodeId===episode.episodeId);if(existing.length){const values=el("div","annotation-list");existing.forEach((annotation)=>values.append(el("p","",`${labelText(annotation.label)}${annotation.note?` — ${annotation.note}`:""}`)));details.push(values)}
-    const editor=el("div","annotation-editor");const label=el("select","") as HTMLSelectElement;["useful","unproductive","exploratory","deep_work","administrative","learning","idea_generating","interrupted","misclassified","private_or_excluded"].forEach((value)=>{const option=el("option","",labelText(value)) as HTMLOptionElement;option.value=value;label.append(option)});const note=el("input","") as HTMLInputElement;note.placeholder="Optional note";const save=el("button","secondary","Annotate");save.addEventListener("click",async()=>{await api(`/api/episodes/${encodeURIComponent(episode.episodeId)}/annotations`,{method:"POST",body:JSON.stringify({label:label.value,note:note.value})});await load();showNotice("Episode annotation saved locally.")});editor.append(label,note,save);
-    item.append(head,meta,evidence,pages,...details,editor); list.append(item);
+type EpisodeFilter = "all" | "ideas" | "outputs" | "annotated" | "review";
+
+function episodesCard(episodes: Json[], outputs: Json[], annotations: Json[], corrections: Json[], intervals: EpisodeIntervalView[], ideas: Json[]): HTMLElement {
+  const card = cardShell("Research episodes", "Review the strongest signals first; open an episode for its pages and grouping evidence.", "wide episodes-card");
+  const toolbar = el("div", "episode-toolbar");
+  const filters = el("div", "episode-filters");
+  filters.setAttribute("role", "group");
+  filters.setAttribute("aria-label", "Filter research episodes");
+  const status = el("span", "episode-filter-status");
+  status.setAttribute("aria-live", "polite");
+  const list = scrollRegion(el("div", "episode-list"), "Research episodes", "tall");
+  let activeFilter: EpisodeFilter = "all";
+
+  const filterDefinitions: Array<[EpisodeFilter, string]> = [
+    ["all", "All"],
+    ["ideas", "With ideas"],
+    ["outputs", "With outputs"],
+    ["annotated", "Annotated"],
+    ["review", "Needs review"],
+  ];
+
+  const matchesFilter = (episode: Json): boolean => {
+    const episodeAnnotations = annotations.filter((annotation) => annotation.episodeId === episode.episodeId);
+    if (activeFilter === "ideas") return episode.ideaCount > 0;
+    if (activeFilter === "outputs") return episode.outputCount > 0;
+    if (activeFilter === "annotated") return episodeAnnotations.length > 0;
+    if (activeFilter === "review") return episode.topicLabel === "unlabelled research"
+      || episode.topicConfidence < 0.5
+      || episodeAnnotations.some((annotation) => annotation.label === "misclassified");
+    return true;
+  };
+
+  const renderList = (): void => {
+    const visible = episodes.filter(matchesFilter);
+    status.textContent = `${visible.length} of ${countLabel(episodes.length, "episode")}`;
+    list.replaceChildren();
+    if (!visible.length) {
+      list.append(empty(episodes.length ? "No episodes match this filter." : "No episode evidence for this day."));
+      return;
+    }
+    visible.forEach((episode) => list.append(episodeItem(episode, outputs, annotations, corrections, intervals, ideas, episodes.indexOf(episode) > 0)));
+  };
+
+  filterDefinitions.forEach(([value, text]) => {
+    const button = el("button", `filter-chip${value === activeFilter ? " active" : ""}`, text);
+    button.type = "button";
+    button.setAttribute("aria-pressed", String(value === activeFilter));
+    button.addEventListener("click", () => {
+      activeFilter = value;
+      filters.querySelectorAll<HTMLButtonElement>("button").forEach((candidate) => {
+        const selected = candidate === button;
+        candidate.classList.toggle("active", selected);
+        candidate.setAttribute("aria-pressed", String(selected));
+      });
+      renderList();
+    });
+    filters.append(button);
   });
-  card.append(list); return card;
+
+  toolbar.append(filters, status);
+  card.append(toolbar, list);
+  renderList();
+  return card;
 }
 
-function outputsCard(outputs:Json[]):HTMLElement{const card=cardShell("Linked outputs","Local Git commits associated by time; proximity is evidence, not causation.");const list=el("div","output-list");if(!outputs.length)list.append(empty("No local outputs collected for this day."));outputs.forEach((output)=>{const item=el("article","output");item.append(el("strong","",output.title||"Untitled output"),el("small","",`${clock(output.occurredAt)} · ${output.repository||output.sourceConnector}${output.reference?` · ${String(output.reference).slice(0,8)}`:""}`),el("p","",output.associationReason||"Not linked to an episode"));list.append(item)});card.append(list);return card}
+function episodeItem(episode: Json, outputs: Json[], annotations: Json[], corrections: Json[], intervals: EpisodeIntervalView[], ideas: Json[], hasPrevious: boolean): HTMLElement {
+  const item = el("article", "episode");
+  const head = el("div", "episode-header");
+  const heading = el("div", "episode-heading");
+  heading.append(el("h3", "", episode.topicLabel), el("time", "", `${clock(episode.startedAt)}–${clock(episode.endedAt)}`));
+  const durationValue = el("strong", "episode-duration", formatDuration(episode.activeDurationMs));
+  head.append(heading, durationValue);
 
-function focusCard(periods:Json[]):HTMLElement{const card=cardShell("Focus-period distribution","Continuous topic/domain periods; shorter is descriptive, not worse.");const list=el("div","bar-list");const max=Math.max(1,...periods.map((period)=>period.durationMs));if(!periods.length)list.append(empty("No focus periods derived."));periods.slice(0,10).forEach((period)=>list.append(barRow(period.domain||"Mixed context",duration(period.durationMs),period.durationMs/max)));card.append(list);return card}
+  const meta = el("div", "episode-meta");
+  [
+    countLabel(episode.uniqueDomains, "domain"),
+    countLabel(episode.tabSwitchCount, "tab switch"),
+    countLabel(episode.ideaCount, "idea"),
+    countLabel(episode.outputCount, "output"),
+  ].forEach((value) => meta.append(el("span", "", value)));
 
-function boundariesCard(boundaries:Json[]):HTMLElement{const card=cardShell("State boundaries","Idle, browser-focus, and tracking transitions that start or stop active time.");const list=el("div","boundary-list");if(!boundaries.length)list.append(empty("No state boundaries recorded."));boundaries.forEach((boundary)=>{const row=el("p","");row.append(el("time","",clock(boundary.occurredAt)),el("span","",labelText(boundary.eventType)));list.append(row)});card.append(list);return card}
+  const pageSummaries = summarizeEpisodePages(episode.intervalIds, intervals);
+  const domains = [...new Set(pageSummaries.map((page) => page.domain).filter(Boolean))];
+  const context = el("p", "episode-context", domains.length ? domains.slice(0, 4).join(" · ") : "Private or excluded context");
+  if (domains.length > 4) context.append(` · +${domains.length - 4} more`);
+
+  const linked = outputs.filter((output) => output.episodeId === episode.episodeId);
+  const relatedIdeas = ideas.filter((idea) => idea.episodeId === episode.episodeId);
+  const signals = el("div", "episode-signals");
+  relatedIdeas.forEach((idea) => signals.append(el("p", "episode-idea", `“${idea.text}”`)));
+  linked.forEach((output) => signals.append(el("p", "episode-output", `↗ ${output.title || output.reference || "Local output"}`)));
+
+  const existing = annotations.filter((annotation) => annotation.episodeId === episode.episodeId);
+  const annotationList = el("div", "annotation-list");
+  existing.forEach((annotation) => annotationList.append(el("p", "", `${labelText(annotation.label)}${annotation.note ? ` — ${annotation.note}` : ""}`)));
+
+  const details = el("details", "episode-details");
+  const detailsSummary = el("summary", "", `${countLabel(pageSummaries.length, "page")} and grouping evidence`);
+  const pages = el("ol", "episode-pages");
+  pageSummaries.forEach((page) => {
+    const row = el("li", "episode-page");
+    const pageTitle = el("span", "episode-page-title", page.title);
+    const pageMeta = el("small", "", [
+      clock(page.startedAt),
+      page.domain || "excluded",
+      page.visits > 1 ? countLabel(page.visits, "visit") : null,
+      formatDuration(page.durationMs),
+    ].filter(Boolean).join(" · "));
+    row.append(pageTitle, pageMeta);
+    pages.append(row);
+  });
+  const evidence = el("ul", "evidence");
+  episode.evidence.forEach((value: string) => evidence.append(el("li", "", value)));
+  details.append(detailsSummary, pages, evidence);
+
+  const annotationDisclosure = el("details", "annotation-disclosure");
+  annotationDisclosure.append(el("summary", "", existing.length ? "Add another annotation" : "Add annotation"));
+  annotationDisclosure.append(annotationEditor(episode));
+
+  const correctionDisclosure = el("details", "annotation-disclosure");
+  correctionDisclosure.append(el("summary", "", "Correct grouping or topic"));
+  correctionDisclosure.append(episodeCorrectionEditor(episode, corrections, intervals, hasPrevious));
+
+  item.append(head, meta, context);
+  if (signals.childElementCount) item.append(signals);
+  if (annotationList.childElementCount) item.append(annotationList);
+  item.append(details, annotationDisclosure, correctionDisclosure);
+  return item;
+}
+
+function episodeCorrectionEditor(episode: Json, corrections: Json[], intervals: EpisodeIntervalView[], hasPrevious: boolean): HTMLElement {
+  const editor = el("div", "correction-editor");
+  const relevant = corrections.filter((correction) => episode.intervalIds.includes(correction.anchorIntervalId));
+  if (relevant.length) {
+    const list = el("div", "correction-list");
+    relevant.forEach((correction) => {
+      const row = el("div", "correction-row");
+      row.append(el("span", "", correction.correctionType === "rename" ? `Topic renamed to “${correction.label}”` : labelText(correction.correctionType)));
+      const undo = el("button", "secondary", "Undo");
+      undo.type = "button";
+      undo.addEventListener("click", async () => {
+        await api(`/api/episode-corrections/${encodeURIComponent(correction.correctionId)}`, { method: "DELETE" });
+        await load();
+        showNotice("Episode correction removed.");
+      });
+      row.append(undo);
+      list.append(row);
+    });
+    editor.append(list);
+  }
+
+  const rename = inputField("Corrected topic label", episode.topicLabelSource === "user" ? episode.topicLabel : "");
+  const renameButton = el("button", "secondary", "Rename topic");
+  renameButton.type = "button";
+  renameButton.addEventListener("click", async () => {
+    if (!rename.input.value.trim()) return;
+    await saveEpisodeCorrection(episode.episodeId, { correctionType: "rename", label: rename.input.value });
+  });
+  const renameRow = el("div", "correction-action");
+  renameRow.append(rename.wrapper, renameButton);
+  editor.append(renameRow);
+
+  if (episode.intervalIds.length > 1) {
+    const splitField = el("label", "field");
+    const splitSelect = el("select", "") as HTMLSelectElement;
+    const intervalsById = new Map(intervals.map((interval) => [interval.intervalId, interval]));
+    episode.intervalIds.slice(1).forEach((intervalId: string) => {
+      const interval = intervalsById.get(intervalId);
+      const option = el("option", "", `${interval ? clock(interval.startedAt) : "Later"} · ${interval?.title || interval?.domain || "Private context"}`) as HTMLOptionElement;
+      option.value = intervalId;
+      splitSelect.append(option);
+    });
+    splitField.append(el("span", "", "Start a new episode before"), splitSelect);
+    const splitButton = el("button", "secondary", "Split episode");
+    splitButton.type = "button";
+    splitButton.addEventListener("click", async () => saveEpisodeCorrection(episode.episodeId, { correctionType: "split_before", beforeIntervalId: splitSelect.value }));
+    const splitRow = el("div", "correction-action");
+    splitRow.append(splitField, splitButton);
+    editor.append(splitRow);
+  }
+
+  if (hasPrevious) {
+    const mergeButton = el("button", "secondary", "Merge with previous episode");
+    mergeButton.type = "button";
+    mergeButton.addEventListener("click", async () => saveEpisodeCorrection(episode.episodeId, { correctionType: "merge_before" }));
+    editor.append(mergeButton);
+  }
+  return editor;
+}
+
+async function saveEpisodeCorrection(episodeId: string, correction: Json): Promise<void> {
+  await api(`/api/episodes/${encodeURIComponent(episodeId)}/corrections`, { method: "POST", body: JSON.stringify(correction) });
+  await load();
+  showNotice("Episode correction saved and derivations rebuilt.");
+}
+
+function annotationEditor(episode: Json): HTMLElement {
+  const editor = el("div", "annotation-editor");
+  const labelField = el("label", "annotation-field");
+  const label = el("select", "") as HTMLSelectElement;
+  const placeholder = el("option", "", "Choose label") as HTMLOptionElement;
+  placeholder.value = "";
+  placeholder.disabled = true;
+  placeholder.selected = true;
+  label.append(placeholder);
+  ["useful", "unproductive", "exploratory", "deep_work", "administrative", "learning", "idea_generating", "interrupted", "misclassified", "private_or_excluded"].forEach((value) => {
+    const option = el("option", "", labelText(value)) as HTMLOptionElement;
+    option.value = value;
+    label.append(option);
+  });
+  labelField.append(el("span", "annotation-field-label", "Label"), label);
+
+  const noteField = el("label", "annotation-field");
+  const note = el("input", "") as HTMLInputElement;
+  note.placeholder = "Optional note";
+  noteField.append(el("span", "annotation-field-label", "Note"), note);
+
+  const save = el("button", "secondary", "Save annotation");
+  save.type = "button";
+  save.disabled = true;
+  label.addEventListener("change", () => { save.disabled = !label.value; });
+  save.addEventListener("click", async () => {
+    if (!label.value) return;
+    save.disabled = true;
+    save.textContent = "Saving…";
+    try {
+      await api(`/api/episodes/${encodeURIComponent(episode.episodeId)}/annotations`, { method: "POST", body: JSON.stringify({ label: label.value, note: note.value }) });
+      await load();
+      showNotice("Episode annotation saved locally.");
+    } finally {
+      save.disabled = false;
+      save.textContent = "Save annotation";
+    }
+  });
+  editor.append(labelField, noteField, save);
+  return editor;
+}
+
+function outputsCard(outputs:Json[]):HTMLElement{const card=cardShell("Linked outputs","Local Git commits associated by time; proximity is evidence, not causation.");const list=scrollRegion(el("div","output-list"),"Linked outputs");if(!outputs.length)list.append(empty("No local outputs collected for this day."));outputs.forEach((output)=>{const item=el("article","output");item.append(el("strong","",output.title||"Untitled output"),el("small","",`${clock(output.occurredAt)} · ${output.repository||output.sourceConnector}${output.reference?` · ${String(output.reference).slice(0,8)}`:""}`),el("p","",output.associationReason||"Not linked to an episode"));list.append(item)});card.append(list);return card}
+
+function focusCard(periods:FocusPeriodView[]):HTMLElement{const contexts=summarizeFocusPeriods(periods);const card=cardShell("Focus by context","Total observed foreground time across distinct focus periods.");const list=scrollRegion(el("div","bar-list"),"Focus by context");const max=Math.max(1,...contexts.map((context)=>context.durationMs));if(!contexts.length)list.append(empty("No focus periods derived."));contexts.slice(0,10).forEach((context)=>list.append(barRow(context.domain||"Mixed context",duration(context.durationMs),context.durationMs/max,countLabel(context.periodCount,"period"))));card.append(list);return card}
+
+function boundariesCard(boundaries:Json[]):HTMLElement{const card=cardShell("State boundaries","Idle, browser-focus, and tracking transitions that start or stop active time.");const list=scrollRegion(el("div","boundary-list"),"State boundaries");if(!boundaries.length)list.append(empty("No state boundaries recorded."));boundaries.forEach((boundary)=>{const row=el("p","");row.append(el("time","",clock(boundary.occurredAt)),el("span","",labelText(boundary.eventType)));list.append(row)});card.append(list);return card}
 
 function ideasCard(ideas: Json[]): HTMLElement {
-  const card = cardShell("Captured ideas", "Explicit thoughts, linked to their browsing context."); const list = el("div","idea-list");
+  const card = cardShell("Captured ideas", "Explicit thoughts, linked to their browsing context."); const list = scrollRegion(el("div","idea-list"), "Captured ideas");
   if (!ideas.length) list.append(empty("No ideas captured on this day."));
   ideas.forEach((idea) => { const item=el("article","idea"); item.append(el("p","",idea.text),el("small","",`${clock(idea.capturedAt)}${idea.episodeId?" · linked to episode":""}`)); const tags=el("div",""); idea.tags.forEach((tag:string)=>tags.append(el("span","tag",tag))); item.append(tags); list.append(item); });
   card.append(list); return card;
@@ -122,9 +344,9 @@ function renderRange(data: Json): void {
   const grid=el("section","grid"); const chart=cardShell("Activity by day","Observed foreground duration; height is not a productivity score.","wide"); const bars=el("div","range-chart"); const max=Math.max(1,...data.daily.map((day:Json)=>day.activeDurationMs)); data.daily.forEach((day:Json)=>{const wrapper=el("div","day-bar");const bar=el("i","");bar.style.height=`${Math.max(1,(day.activeDurationMs/max)*100)}%`;bar.title=`${day.date}: ${duration(day.activeDurationMs)}`;wrapper.append(bar,el("span","",day.date.slice(5)));bars.append(wrapper)});chart.append(bars);grid.append(chart,timeOfDayCard(data.activityByHour),domainsCard(data.topDomains),topicsCard(data.topics),revisitsCard(data.revisitedPages));content.replaceChildren(metrics,grid);
 }
 
-function topicsCard(topics: Json[]): HTMLElement { const card=cardShell("Topics explored","Deterministic labels inferred from titles and URLs.");const list=el("div","bar-list");const max=topics[0]?.activeDurationMs||1;if(!topics.length)list.append(empty("No topic evidence."));topics.forEach((item)=>list.append(barRow(item.topic,duration(item.activeDurationMs),item.activeDurationMs/max)));card.append(list);return card; }
-function revisitsCard(items: Json[]): HTMLElement { const card=cardShell("Revisited pages","Repeated canonical URLs in this window.");const list=el("div","bar-list");if(!items.length)list.append(empty("No repeated pages."));items.forEach((item)=>list.append(barRow(item.title||new URL(item.url).hostname,`${item.visits} intervals`,Math.min(1,item.visits/5))));card.append(list);return card; }
-function timeOfDayCard(hours:Json[]):HTMLElement{const card=cardShell("Time-of-day pattern","Active foreground duration by UTC hour.","wide");const chart=el("div","hour-chart");const max=Math.max(1,...hours.map((hour)=>hour.activeDurationMs));hours.forEach((hour)=>{const bar=el("div","hour-column");const fill=el("i","");fill.style.height=`${Math.max(1,(hour.activeDurationMs/max)*100)}%`;fill.title=`${String(hour.hour).padStart(2,"0")}:00 · ${duration(hour.activeDurationMs)}`;bar.append(fill,el("span","",String(hour.hour).padStart(2,"0")));chart.append(bar)});card.append(chart);return card}
+function topicsCard(topics: Json[]): HTMLElement { const card=cardShell("Topics explored","Deterministic labels inferred from titles and URLs.");const list=scrollRegion(el("div","bar-list"),"Topics explored");const max=topics[0]?.activeDurationMs||1;if(!topics.length)list.append(empty("No topic evidence."));topics.forEach((item)=>list.append(barRow(item.topic,duration(item.activeDurationMs),item.activeDurationMs/max)));card.append(list);return card; }
+function revisitsCard(items: Json[]): HTMLElement { const card=cardShell("Revisited pages","Repeated canonical URLs in this window.");const list=scrollRegion(el("div","bar-list"),"Revisited pages");if(!items.length)list.append(empty("No repeated pages."));items.forEach((item)=>list.append(barRow(item.title||new URL(item.url).hostname,`${item.visits} intervals`,Math.min(1,item.visits/5))));card.append(list);return card; }
+function timeOfDayCard(hours:Json[]):HTMLElement{const card=cardShell("Time-of-day pattern",`Active foreground duration by local hour (${timeZone}).`,"wide");const chart=el("div","hour-chart");const max=Math.max(1,...hours.map((hour)=>hour.activeDurationMs));hours.forEach((hour)=>{const bar=el("div","hour-column");const fill=el("i","");fill.style.height=`${Math.max(1,(hour.activeDurationMs/max)*100)}%`;fill.title=`${String(hour.hour).padStart(2,"0")}:00 · ${duration(hour.activeDurationMs)}`;bar.append(fill,el("span","",String(hour.hour).padStart(2,"0")));chart.append(bar)});card.append(chart);return card}
 
 async function renderSettings(): Promise<void> {
   const [settings,profiles,history,control]=await Promise.all([api("/api/settings"),api("/api/profiles"),api("/api/history/summary"),api("/api/control")]); const grid=el("section","settings-grid");
@@ -136,18 +358,107 @@ async function renderSettings(): Promise<void> {
   const tracking=cardShell("Tracking control","Collector-enforced immediately; the extension mirrors this state on its next control sync.");const trackingState=el("p","control-state",control.trackingEnabled?"Tracking active":"Tracking paused");const trackingButton=el("button",control.trackingEnabled?"danger":"primary",control.trackingEnabled?"Pause tracking":"Resume tracking");trackingButton.addEventListener("click",async()=>{const next=await api("/api/control",{method:"PUT",body:JSON.stringify({trackingEnabled:!control.trackingEnabled})});control.trackingEnabled=next.trackingEnabled;trackingState.textContent=next.trackingEnabled?"Tracking active":"Tracking paused";trackingButton.textContent=next.trackingEnabled?"Pause tracking":"Resume tracking";trackingButton.className=next.trackingEnabled?"danger":"primary";showNotice(next.trackingEnabled?"Tracking resumed. The extension will synchronize shortly.":"Tracking paused at the collector. New activity batches are discarded.")});tracking.append(trackingState,trackingButton);
   const retention=cardShell("Retention","Raw and derived records remain until you delete them; automatic irreversible compaction is disabled.");retention.append(el("p","control-state",`${settings.retention.mode} · manual deletion and export controls below`));
   const controls=cardShell("Delete & export","Deletion rebuilds derived intervals and episodes. Export is explicit and stays local.");const delDomain=inputField("Delete by domain","example.com");const from=inputField("From (ISO timestamp)","");const to=inputField("To (ISO timestamp)","");const actions=el("div","actions");const deleteButton=el("button","danger","Delete matching data");deleteButton.addEventListener("click",async()=>{if(!confirm("Permanently delete matching raw and derived data?"))return;const result=await api("/api/data",{method:"DELETE",body:JSON.stringify({domain:delDomain.input.value||undefined,from:from.input.value||undefined,to:to.input.value||undefined})});showNotice(`Deleted ${result.activityEventsDeleted} events and ${result.historicalVisitsDeleted} historical visits.`)});const exportButton=el("button","secondary","Export JSON");exportButton.addEventListener("click",downloadExport);const tokenButton=el("button","secondary","Change dashboard token");tokenButton.addEventListener("click",()=>{token="";localStorage.removeItem("chromelens-token");requireToken()});actions.append(deleteButton,exportButton,tokenButton);controls.append(delDomain.wrapper,from.wrapper,to.wrapper,actions);
-  const llm=cardShell("Optional LLM reflection","Interpretation remains separate from observed evidence.");const off=el("div","llm-off");off.append(el("i",""),el("span","",settings.llm.message));llm.append(off);
+  const llm=analysisExportCard(settings.llm);
   grid.append(privacy,tracking,retention,imports,git,controls,llm);content.replaceChildren(grid);
 }
 
+function analysisExportCard(llmSettings: Json): HTMLElement {
+  const card = cardShell("LLM analysis export", "Preview the exact, range-limited payload before sharing it with a model you choose.", "llm-export");
+  const message = el("p", "analysis-guidance", llmSettings.message);
+  const fields = el("div", "analysis-fields");
+  const from = inputField("From", "");
+  from.input.type = "date";
+  from.input.value = shiftCalendarDate(dateInput.value, -6);
+  const to = inputField("To", "");
+  to.input.type = "date";
+  to.input.value = dateInput.value;
+  const privacy = selectField("Privacy profile", [
+    ["aggregate", "Aggregate — domains and durations only"],
+    ["contextual", "Contextual — add titles, ideas, outputs, and notes"],
+    ["detailed", "Detailed — also include retained URLs"],
+  ], "aggregate");
+  const format = selectField("Format", [["markdown", "Markdown"], ["jsonl", "JSONL"]], "markdown");
+  const budget = inputField("Approximate token budget", "50000");
+  budget.input.type = "number";
+  budget.input.min = "500";
+  budget.input.max = "200000";
+  budget.input.value = "50000";
+  fields.append(from.wrapper, to.wrapper, privacy.wrapper, format.wrapper, budget.wrapper);
+
+  const status = el("p", "analysis-status", "Aggregate mode omits titles, URL paths, idea text, output titles, and annotation notes.");
+  const preview = el("textarea", "analysis-preview") as HTMLTextAreaElement;
+  preview.readOnly = true;
+  preview.hidden = true;
+  preview.setAttribute("aria-label", "Exact LLM analysis export preview");
+  const actions = el("div", "actions");
+  const previewButton = el("button", "secondary", "Preview exact payload");
+  previewButton.type = "button";
+  const downloadButton = el("button", "primary", "Download analysis pack");
+  downloadButton.type = "button";
+  downloadButton.disabled = true;
+  let previewedArtifact: Json | null = null;
+  let previewedQuery = "";
+
+  const query = (): string => analysisExportQuery({
+    from: from.input.value,
+    to: to.input.value,
+    privacy: privacy.input.value,
+    format: format.input.value,
+    maxTokens: budget.input.value,
+  });
+  const invalidatePreview = (): void => {
+    previewedArtifact = null;
+    previewedQuery = "";
+    downloadButton.disabled = true;
+    preview.hidden = true;
+    preview.value = "";
+    status.textContent = "Options changed. Preview the exact payload before download.";
+  };
+  [from.input, to.input, privacy.input, format.input, budget.input].forEach((input) => {
+    input.addEventListener("input", invalidatePreview);
+    input.addEventListener("change", invalidatePreview);
+  });
+  previewButton.addEventListener("click", async () => {
+    const requestedQuery = query();
+    invalidatePreview();
+    previewButton.disabled = true;
+    previewButton.textContent = "Preparing…";
+    try {
+      const artifact = await api(`/api/export/preview?${requestedQuery}`);
+      preview.value = artifact.content;
+      preview.hidden = false;
+      previewedArtifact = artifact;
+      previewedQuery = requestedQuery;
+      downloadButton.disabled = false;
+      status.textContent = `${artifact.estimatedTokens.toLocaleString()} estimated tokens · ${artifact.includedEpisodes} of ${artifact.totalEpisodes} episodes${artifact.truncated ? " · truncated to budget" : ""}.`;
+    } finally {
+      previewButton.disabled = false;
+      previewButton.textContent = "Preview exact payload";
+    }
+  });
+  downloadButton.addEventListener("click", () => {
+    if (!previewedArtifact || previewedQuery !== query()) return invalidatePreview();
+    downloadPreviewedArtifact(previewedArtifact);
+  });
+  actions.append(previewButton, downloadButton);
+  card.append(message, fields, status, actions, preview);
+  return card;
+}
+
 async function downloadExport(): Promise<void> { const response=await fetch("/api/export?format=json",{headers:{authorization:`Bearer ${token}`}});if(!response.ok)throw new HttpError(response.status);const blob=await response.blob();const url=URL.createObjectURL(blob);const anchor=document.createElement("a");anchor.href=url;anchor.download=`chromelens-export-${new Date().toISOString().slice(0,10)}.json`;anchor.click();URL.revokeObjectURL(url); }
+function downloadPreviewedArtifact(artifact:Json):void{const blob=new Blob([artifact.content],{type:artifact.mediaType});const objectUrl=URL.createObjectURL(blob);const anchor=document.createElement("a");anchor.href=objectUrl;anchor.download=artifact.filename;anchor.click();URL.revokeObjectURL(objectUrl)}
+function analysisExportQuery(values:{from:string;to:string;privacy:string;format:string;maxTokens:string}):string{const query=new URLSearchParams({format:`llm-${values.format}`,from:values.from,to:values.to,timezone:timeZone,privacy:values.privacy,maxTokens:values.maxTokens});return query.toString()}
 async function api(path:string,init:RequestInit={}):Promise<Json>{const response=await fetch(path,{...init,headers:{"content-type":"application/json",authorization:`Bearer ${token}`,...init.headers}});if(!response.ok)throw new HttpError(response.status);return response.json() as Promise<Json>}
 class HttpError extends Error { constructor(readonly status:number){super(`Collector returned ${status}`)} }
 function requireToken():void { if(!tokenDialog.open)tokenDialog.showModal();content.replaceChildren(el("div","empty","Enter the local collector token to view data.")); }
-function periodDays():number{return view==="month"?30:view==="week"?7:1} function shiftDate(days:number):void{dateInput.value=new Date(Date.parse(`${dateInput.value}T00:00:00Z`)+days*86400000).toISOString().slice(0,10);void load()}
+function periodDays():number{return view==="month"?30:view==="week"?7:1} function shiftDate(days:number):void{dateInput.value=shiftCalendarDate(dateInput.value,days);void load()}
 function el<K extends keyof HTMLElementTagNameMap>(tag:K,className="",text=""):HTMLElementTagNameMap[K]{const node=document.createElement(tag);if(className)node.className=className;if(text)node.textContent=text;return node} function empty(text:string){return el("div","empty",text)}
-function cardShell(title:string,subtitle:string,extra=""):HTMLElement{const card=el("section",`card ${extra}`.trim());card.append(el("h2","",title),el("p","card-subtitle",subtitle));return card} function metric(label:string,value:string,note:string):HTMLElement{const node=el("article","metric");node.append(el("p","",label),el("strong","",value),el("small","",note));return node} function barRow(label:string,value:string,ratio:number):HTMLElement{const row=el("div","bar-row");row.append(el("span","",label),el("strong","",value));const bar=el("div","bar");const fill=el("i","");fill.style.width=`${Math.max(1,Math.min(100,ratio*100))}%`;bar.append(fill);row.append(bar);return row}
-function duration(ms:number):string{if(!ms)return "0m";const hours=Math.floor(ms/3600000);const minutes=Math.round((ms%3600000)/60000);return hours?`${hours}h ${minutes}m`:`${minutes}m`} function clock(iso:string):string{return new Date(iso).toISOString().slice(11,16)} function number(value:number):string{return Number(value||0).toFixed(1)} function median(values:number[]):number{if(!values.length)return 0;const sorted=[...values].sort((a,b)=>a-b),mid=Math.floor(sorted.length/2);return sorted.length%2?sorted[mid]!:(sorted[mid-1]!+sorted[mid]!)/2}
+function scrollRegion<T extends HTMLElement>(node:T,label:string,size:"standard"|"tall"="standard"):T{node.classList.add("scroll-region");if(size==="tall")node.classList.add("scroll-region-tall");node.tabIndex=0;node.setAttribute("role","region");node.setAttribute("aria-label",label);return node}
+function cardShell(title:string,subtitle:string,extra=""):HTMLElement{const card=el("section",`card ${extra}`.trim());card.append(el("h2","",title),el("p","card-subtitle",subtitle));return card} function metric(label:string,value:string,note:string):HTMLElement{const node=el("article","metric");node.append(el("p","",label),el("strong","",value),el("small","",note));return node} function barRow(label:string,value:string,ratio:number,note=""):HTMLElement{const row=el("div","bar-row");row.append(el("span","",label),el("strong","",value));if(note)row.append(el("small","bar-row-note",note));const bar=el("div","bar");const fill=el("i","");fill.style.width=`${Math.max(1,Math.min(100,ratio*100))}%`;bar.append(fill);row.append(bar);return row}
+function duration(ms:number):string{return formatDuration(ms)} function clock(iso:string):string{return new Intl.DateTimeFormat("en-GB",{timeZone,hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).format(new Date(iso))} function number(value:number):string{return Number(value||0).toFixed(1)} function median(values:number[]):number{if(!values.length)return 0;const sorted=[...values].sort((a,b)=>a-b),mid=Math.floor(sorted.length/2);return sorted.length%2?sorted[mid]!:(sorted[mid-1]!+sorted[mid]!)/2}
+function localCalendarDate(value:Date):string{const parts=new Intl.DateTimeFormat("en-GB",{timeZone,year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(value);const part=(type:string)=>parts.find((item)=>item.type===type)!.value;return `${part("year")}-${part("month")}-${part("day")}`}
+function shiftCalendarDate(date:string,days:number):string{const [year,month,day]=date.split("-").map(Number) as [number,number,number];return new Date(Date.UTC(year,month-1,day+days)).toISOString().slice(0,10)}
+function minuteWithinCalendarDay(iso:string,date:string,isEnd:boolean):number{const value=new Date(iso);const localDate=localCalendarDate(value);if(localDate<date)return 0;if(localDate>date)return 1440;const parts=new Intl.DateTimeFormat("en-GB",{timeZone,hour:"2-digit",minute:"2-digit",second:"2-digit",hourCycle:"h23"}).formatToParts(value);const part=(type:string)=>Number(parts.find((item)=>item.type===type)!.value);const minute=part("hour")*60+part("minute")+part("second")/60;return isEnd&&minute===0?1440:minute}
 function labelText(value:string):string{return value.split("_").map((part)=>part[0]?.toUpperCase()+part.slice(1)).join(" ")}
 function showNotice(text:string):void{notice.textContent=text;notice.hidden=false}
 function textareaField(label:string,value:string){const wrapper=el("label","field"),input=el("textarea","") as HTMLTextAreaElement;input.value=value;wrapper.append(el("span","",label),input);return{wrapper,input}} function inputField(label:string,placeholder:string){const wrapper=el("label","field"),input=el("input","") as HTMLInputElement;input.placeholder=placeholder;wrapper.append(el("span","",label),input);return{wrapper,input}} function selectField(label:string,values:string[][],selected:string){const wrapper=el("label","field"),input=el("select","") as HTMLSelectElement;values.forEach(([value,text])=>{const option=el("option","",text) as HTMLOptionElement;option.value=value!;option.selected=value===selected;input.append(option)});wrapper.append(el("span","",label),input);return{wrapper,input}} function checkField(label:string,checked:boolean){const wrapper=el("label","check"),input=el("input","") as HTMLInputElement;input.type="checkbox";input.checked=checked;wrapper.append(input,el("span","",label));return{wrapper,input}}

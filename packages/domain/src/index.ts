@@ -71,6 +71,7 @@ export interface ResearchEpisode {
   endedAt: string;
   topicLabel: string;
   topicConfidence: number;
+  topicLabelSource: "deterministic" | "user";
   activeDurationMs: number;
   idleDurationMs: number;
   uniqueDomains: number;
@@ -82,6 +83,17 @@ export interface ResearchEpisode {
   derivationVersion: 1;
   evidence: string[];
   intervalIds: string[];
+}
+
+export const EPISODE_CORRECTION_TYPES = ["rename", "split_before", "merge_before"] as const;
+export type EpisodeCorrectionType = (typeof EPISODE_CORRECTION_TYPES)[number];
+
+export interface EpisodeCorrection {
+  correctionId: string;
+  createdAt: string;
+  correctionType: EpisodeCorrectionType;
+  anchorIntervalId: string;
+  label: string | null;
 }
 
 export interface FocusPeriod {
@@ -154,6 +166,9 @@ export interface EpisodeAnnotation {
   episodeId: string;
   label: EpisodeAnnotationLabel;
   note: string | null;
+  anchorIntervalIds: string[];
+  anchorStartedAt: string | null;
+  anchorEndedAt: string | null;
 }
 
 export function isActivityEventType(value: unknown): value is ActivityEventType {

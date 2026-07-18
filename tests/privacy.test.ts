@@ -45,4 +45,10 @@ describe("privacy enforcement", () => {
     expect(redacted.url).not.toContain("#notes");
     expect(collectorUi).toMatchObject({ url: null, domain: null, metadata: { excluded: true } });
   });
+
+  it("normalizes an empty pending-navigation URL to a URL-free transition", () => {
+    const pendingNavigation = sanitizeActivityEvent(event(""), defaultPrivacySettings);
+
+    expect(pendingNavigation).toMatchObject({ url: null, canonicalUrl: null, domain: null });
+  });
 });
