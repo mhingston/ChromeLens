@@ -1,6 +1,6 @@
 # Privacy and retention
 
-ChromeLens is local-first. The collector binds to loopback, the SQLite database and authentication token remain under the configured local data directory, and no third-party analytics or LLM client is included.
+ChromeLens is local-first. The collector binds to loopback, the SQLite database and authentication token remain under the configured local data directory, and no third-party analytics or built-in LLM client is included.
 
 Collection is visible in the extension popup and can be paused. Incognito events are rejected unless the user explicitly enables them. The extension does not request scripting access, inspect page content, capture selected text automatically, read forms, log keys, monitor the clipboard, or take screenshots.
 
@@ -8,6 +8,6 @@ Privacy rules are applied twice: before an event enters the extension queue and 
 
 The Git connector runs only after an authenticated, explicit local request. Output records contain repository basename, commit ID, subject, time, author, and association evidence; no diffs, file contents, remotes, or repository paths are copied into output facts. The selected path remains only in local connector settings for reuse.
 
-Raw and derived data are retained until the user deletes them. The dashboard supports deletion by domain, URL, time range, session, and browser profile, then rebuilds derivations. Export is explicit. Database files may still be exposed by device compromise or cloud backup; use full-disk encryption and exclude the data directory from cloud sync.
+Raw and derived data are retained until the user deletes them. The dashboard supports deletion by domain, URL, time range, session, and browser profile, then rebuilds derivations. Human annotations carry evidence anchors so normal derivation changes do not delete them; explicit deletion prunes annotations whose underlying evidence no longer exists. Export is explicit. Database files may still be exposed by device compromise or cloud backup; use full-disk encryption and exclude the data directory from cloud sync.
 
-LLM reflection is disabled and unimplemented in this release. A future implementation must preview a deliberately selected aggregate payload and treat all browser-derived strings as untrusted observations.
+LLM model execution remains external and opt-in. The dashboard requires a selected date range and previews the exact analysis-pack payload before download. Aggregate mode omits titles, URL paths, idea text, output titles, and notes; contextual mode adds those strings but not URLs; detailed mode adds retained canonical URLs. Every pack marks browser-derived and user-authored strings as untrusted observations, includes evidence references, and preserves the distinction between observed, derived, and authored data. Downloading a pack creates a sensitive local file; sharing it with a model is a separate user decision governed by that provider's privacy terms.

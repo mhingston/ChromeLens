@@ -121,13 +121,22 @@ describe("loopback collector", () => {
     const annotated = await fetch(`${address}/api/episodes/${firstSummary.episodes[0]!.episodeId}/annotations`, {
       method: "POST", headers, body: JSON.stringify({ label: "learning", note: "The sources informed a concrete commit" }),
     });
-    const finalSummary = await (await fetch(`${address}/api/summary/daily?date=2026-07-18`, { headers })).json() as { annotations: unknown[] };
+    const corrected = await fetch(`${address}/api/episodes/${firstSummary.episodes[0]!.episodeId}/corrections`, {
+      method: "POST", headers, body: JSON.stringify({ correctionType: "rename", label: "Corrected browser evidence" }),
+    });
+    const correction = await corrected.json() as { correctionId: string };
+    const finalSummary = await (await fetch(`${address}/api/summary/daily?date=2026-07-18`, { headers })).json() as { annotations: unknown[]; episodes: Array<{ topicLabel: string }>; corrections: unknown[] };
+    const removed = await fetch(`${address}/api/episode-corrections/${correction.correctionId}`, { method: "DELETE", headers });
 
     expect(collected.status).toBe(200);
     expect(await collected.json()).toMatchObject({ collected: 1, inserted: 1, outputLinks: 1 });
     expect(firstSummary.outputs).toHaveLength(1);
     expect(annotated.status).toBe(201);
     expect(finalSummary.annotations).toHaveLength(1);
+    expect(corrected.status).toBe(201);
+    expect(finalSummary.episodes[0]!.topicLabel).toBe("Corrected browser evidence");
+    expect(finalSummary.corrections).toHaveLength(1);
+    expect(removed.status).toBe(200);
     store.close();
   });
 
@@ -153,6 +162,39 @@ describe("loopback collector", () => {
     expect(await ingestion.json()).toMatchObject({ received: 1, inserted: 0, droppedWhilePaused: 1 });
     expect(await control.json()).toMatchObject({ trackingEnabled: false, updatedAt: expect.any(String) });
     expect(store.readActivityEvents()).toHaveLength(0);
+    store.close();
+  });
+
+  it("previews and downloads range-limited LLM analysis packs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "chromelens-analysis-export-"));
+    const store = new ActivityStore(join(root, "collector.sqlite"));
+    const server = createCollectorServer({ store, token: "test-secret", host: "127.0.0.1", port: 0 });
+    running.push(server);
+    const address = await server.start();
+    const headers = { "content-type": "application/json", authorization: "Bearer test-secret" };
+    const base = {
+      schemaVersion: 1 as const, deviceId: "device", browser: "chrome" as const, browserVersion: null,
+      browserProfileId: "chrome:Default", browserSessionId: "session", windowId: "session:1",
+      tabId: null, url: null, canonicalUrl: null, domain: null, title: null, navigationType: null,
+      referrerUrl: null, idleState: "active" as const, incognito: false, metadata: {},
+    };
+    await fetch(`${address}/api/events`, { method: "POST", headers, body: JSON.stringify({ events: [
+      { ...base, eventId: crypto.randomUUID(), eventType: "window_focused", occurredAt: "2026-07-18T09:00:00.000Z" },
+      { ...base, eventId: crypto.randomUUID(), eventType: "tab_activated", occurredAt: "2026-07-18T09:00:00.000Z", tabId: "A", url: "https://example.com/private-path", title: "Private page title" },
+      { ...base, eventId: crypto.randomUUID(), eventType: "window_blurred", occurredAt: "2026-07-18T09:10:00.000Z" },
+    ] }) });
+    const query = "format=llm-markdown&from=2026-07-18&to=2026-07-18&timezone=Europe%2FLondon&privacy=aggregate&maxTokens=10000";
+    const preview = await fetch(`${address}/api/export/preview?${query}`, { headers });
+    const downloaded = await fetch(`${address}/api/export?${query}`, { headers });
+    const previewBody = await preview.json() as { content: string; estimatedTokens: number };
+
+    expect(preview.status).toBe(200);
+    expect(previewBody.estimatedTokens).toBeGreaterThan(0);
+    expect(previewBody.content).toContain("example.com");
+    expect(previewBody.content).not.toContain("Private page title");
+    expect(downloaded.status).toBe(200);
+    expect(downloaded.headers.get("content-type")).toContain("text/markdown");
+    expect(downloaded.headers.get("content-disposition")).toContain("chromelens-analysis");
     store.close();
   });
 });

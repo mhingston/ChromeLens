@@ -6,6 +6,8 @@ import type {
   ActiveInterval,
   ActivityEvent,
   CapturedIdea,
+  EpisodeCorrection,
+  EpisodeCorrectionType,
   EpisodeAnnotation,
   EpisodeAnnotationLabel,
   FocusPeriod,
@@ -18,6 +20,18 @@ import { EPISODE_ANNOTATION_LABELS } from "../../domain/src/index.ts";
 import { associateOutputsToEpisodes, type OutputAssociationOptions } from "../../connectors/src/index.ts";
 import { sanitizeActivityEvent, type PrivacySettings } from "../../privacy/src/index.ts";
 import { deriveActiveIntervals, deriveFocusPeriods, groupResearchEpisodes } from "../../sessionisation/src/index.ts";
+import {
+  addCalendarDays,
+  bucketActiveByLocalHour,
+  calendarDates,
+  calendarDayWindow,
+  projectActivityWindow,
+} from "../../calendar-analysis/src/index.ts";
+import {
+  createAnalysisExport as renderAnalysisExport,
+  type AnalysisExportArtifact,
+  type AnalysisExportOptions,
+} from "../../analysis-pack/src/index.ts";
 
 export interface IngestionReport {
   received: number;
@@ -29,6 +43,8 @@ export interface IngestionReport {
 
 export interface DailySummary {
   date: string;
+  timeZone: string;
+  window: { start: string; end: string };
   metrics: {
     activeDurationMs: number;
     ideaCount: number;
@@ -44,6 +60,7 @@ export interface DailySummary {
   ideas: CapturedIdea[];
   outputs: LinkedOutput[];
   annotations: EpisodeAnnotation[];
+  corrections: EpisodeCorrection[];
   boundaries: Array<{ eventType: string; occurredAt: string; idleState: string | null }>;
   caveats: string[];
   derivationVersion: 1;
@@ -63,6 +80,13 @@ export interface DeleteReport {
   historicalUrlsDeleted: number;
   historicalVisitsDeleted: number;
   ideasDeleted: number;
+}
+
+export interface EpisodeCorrectionInput {
+  episodeId: string;
+  correctionType: EpisodeCorrectionType;
+  label?: string | null;
+  beforeIntervalId?: string;
 }
 
 export interface HistoricalUrlInput {
@@ -127,6 +151,7 @@ export class ActivityStore {
     this.database = new DatabaseSync(filePath);
     this.database.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
     this.database.exec(INITIAL_SCHEMA);
+    applySchemaMigrations(this.database);
   }
 
   importHistoryBatch(batch: HistoryImportBatch): { urlsInserted: number; visitsInserted: number; searchTermsInserted: number } {
@@ -223,19 +248,83 @@ export class ActivityStore {
 
   addAnnotation(input: { episodeId: string; label: EpisodeAnnotationLabel; note?: string | null }): EpisodeAnnotation {
     if (!(EPISODE_ANNOTATION_LABELS as readonly string[]).includes(input.label)) throw new Error("Unsupported episode annotation label");
-    const episode = this.database.prepare("SELECT 1 FROM research_episodes WHERE episode_id = ?").get(input.episodeId);
-    if (!episode) throw new Error("Research episode not found");
+    const row = this.database.prepare("SELECT * FROM research_episodes WHERE episode_id = ?").get(input.episodeId) as Record<string, unknown> | undefined;
+    if (!row) throw new Error("Research episode not found");
+    const episode = rowToEpisode(row);
     const annotation: EpisodeAnnotation = {
       annotationId: randomUUID(),
       createdAt: new Date().toISOString(),
       episodeId: input.episodeId,
       label: input.label,
       note: input.note?.trim().slice(0, 10_000) || null,
+      anchorIntervalIds: episode.intervalIds,
+      anchorStartedAt: episode.startedAt,
+      anchorEndedAt: episode.endedAt,
     };
     this.database.prepare(`
-      INSERT INTO annotations(annotation_id, created_at, episode_id, label, note) VALUES (?, ?, ?, ?, ?)
-    `).run(annotation.annotationId, annotation.createdAt, annotation.episodeId, annotation.label, annotation.note);
+      INSERT INTO annotations(annotation_id, created_at, episode_id, label, note, evidence_json)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      annotation.annotationId,
+      annotation.createdAt,
+      annotation.episodeId,
+      annotation.label,
+      annotation.note,
+      JSON.stringify(annotationEvidence(annotation)),
+    );
     return annotation;
+  }
+
+  addEpisodeCorrection(input: EpisodeCorrectionInput): EpisodeCorrection {
+    const row = this.database.prepare("SELECT * FROM research_episodes WHERE episode_id = ?").get(input.episodeId) as Record<string, unknown> | undefined;
+    if (!row) throw new Error("Research episode not found");
+    if (input.correctionType !== "rename" && input.correctionType !== "split_before" && input.correctionType !== "merge_before") {
+      throw new Error("Unsupported episode correction type");
+    }
+    const episode = rowToEpisode(row);
+    const anchorIntervalId = input.correctionType === "split_before"
+      ? input.beforeIntervalId ?? ""
+      : episode.intervalIds[0] ?? "";
+    if (!anchorIntervalId || !episode.intervalIds.includes(anchorIntervalId)) throw new Error("Correction anchor is not part of the episode");
+    if (input.correctionType === "split_before" && anchorIntervalId === episode.intervalIds[0]) {
+      throw new Error("An episode cannot be split before its first interval");
+    }
+    const label = input.correctionType === "rename" ? input.label?.trim().slice(0, 200) || null : null;
+    if (input.correctionType === "rename" && !label) throw new Error("A corrected topic label is required");
+    const correction: EpisodeCorrection = {
+      correctionId: randomUUID(),
+      createdAt: new Date().toISOString(),
+      correctionType: input.correctionType,
+      anchorIntervalId,
+      label,
+    };
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      if (correction.correctionType === "split_before" || correction.correctionType === "merge_before") {
+        this.database.prepare(`
+          DELETE FROM episode_corrections
+          WHERE anchor_interval_id = ? AND correction_type IN ('split_before', 'merge_before')
+        `).run(anchorIntervalId);
+      } else {
+        this.database.prepare("DELETE FROM episode_corrections WHERE anchor_interval_id = ? AND correction_type = 'rename'").run(anchorIntervalId);
+      }
+      this.database.prepare(`
+        INSERT INTO episode_corrections(correction_id, created_at, correction_type, anchor_interval_id, label)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(correction.correctionId, correction.createdAt, correction.correctionType, correction.anchorIntervalId, correction.label);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    this.rebuildDerivations();
+    return correction;
+  }
+
+  removeEpisodeCorrection(correctionId: string): boolean {
+    const removed = Number(this.database.prepare("DELETE FROM episode_corrections WHERE correction_id = ?").run(correctionId).changes) > 0;
+    if (removed) this.rebuildDerivations();
+    return removed;
   }
 
   ingestEvents(events: ActivityEvent[], settings: PrivacySettings, receivedAt = new Date().toISOString()): IngestionReport {
@@ -298,12 +387,46 @@ export class ActivityStore {
   }
 
   rebuildDerivations(endAt?: string, associationOptions: OutputAssociationOptions = {}): { intervals: number; episodes: number; outputLinks: number } {
-    const events = this.readActivityEvents();
+    return this.rebuildDerivationsInternal({
+      ...(endAt ? { endAt } : {}),
+      associationOptions,
+      pruneOrphanAnnotations: false,
+    });
+  }
+
+  rebuildSessions(
+    sessionIds: readonly string[],
+    endAt?: string,
+    associationOptions: OutputAssociationOptions = {},
+  ): { intervals: number; episodes: number; outputLinks: number } {
+    const uniqueSessionIds = [...new Set(sessionIds.filter(Boolean))];
+    if (!uniqueSessionIds.length) return this.rebuildDerivations(endAt, associationOptions);
+    return this.rebuildDerivationsInternal({
+      ...(endAt ? { endAt } : {}),
+      associationOptions,
+      sessionIds: uniqueSessionIds,
+      pruneOrphanAnnotations: false,
+    });
+  }
+
+  private rebuildDerivationsInternal(options: {
+    endAt?: string;
+    associationOptions: OutputAssociationOptions;
+    sessionIds?: string[];
+    pruneOrphanAnnotations: boolean;
+  }): { intervals: number; episodes: number; outputLinks: number } {
+    const events = options.sessionIds
+      ? this.readActivityEventsForSessions(options.sessionIds)
+      : this.readActivityEvents();
     const ideas = this.readIdeas();
-    const intervals = deriveActiveIntervals(events, endAt ? { endAt } : {});
-    const episodes = groupResearchEpisodes(intervals, ideas);
+    const derivedIntervals = deriveActiveIntervals(events, options.endAt ? { endAt: options.endAt } : {});
+    const retainedIntervals = options.sessionIds ? this.readStoredIntervalsExcept(options.sessionIds) : [];
+    const intervals = [...retainedIntervals, ...derivedIntervals].sort((left, right) => left.startedAt.localeCompare(right.startedAt));
+    const corrections = this.readEpisodeCorrections();
+    const episodes = groupResearchEpisodes(intervals, ideas, { corrections });
     const outputs = this.readOutputs().map(({ episodeId: _episodeId, associationGapMs: _gap, associationReason: _reason, ...output }) => output);
-    const outputLinks = associateOutputsToEpisodes(outputs, episodes, associationOptions);
+    const outputLinks = associateOutputsToEpisodes(outputs, episodes, options.associationOptions);
+    const annotations = this.readAnnotationsWithCurrentEpisodeEvidence();
     const outputCounts = new Map<string, number>();
     for (const link of outputLinks) outputCounts.set(link.episodeId, (outputCounts.get(link.episodeId) ?? 0) + 1);
     const insertInterval = this.database.prepare(`
@@ -324,10 +447,18 @@ export class ActivityStore {
       INSERT INTO output_episode_links(output_id, episode_id, gap_ms, reason, association_version)
       VALUES (?, ?, ?, ?, ?)
     `);
+    const updateAnnotation = this.database.prepare("UPDATE annotations SET episode_id = ?, evidence_json = ? WHERE annotation_id = ?");
+    const deleteAnnotation = this.database.prepare("DELETE FROM annotations WHERE annotation_id = ?");
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      this.database.exec("DELETE FROM output_episode_links; DELETE FROM active_intervals; DELETE FROM research_episodes; UPDATE captured_ideas SET episode_id = NULL;");
-      for (const interval of intervals) insertInterval.run(
+      this.database.exec("DELETE FROM output_episode_links; DELETE FROM research_episodes; UPDATE captured_ideas SET episode_id = NULL;");
+      if (options.sessionIds) {
+        const placeholders = options.sessionIds.map(() => "?").join(",");
+        this.database.prepare(`DELETE FROM active_intervals WHERE browser_session_id IN (${placeholders})`).run(...options.sessionIds);
+      } else {
+        this.database.exec("DELETE FROM active_intervals");
+      }
+      for (const interval of (options.sessionIds ? derivedIntervals : intervals)) insertInterval.run(
         interval.intervalId, interval.deviceId, interval.browserProfileId, interval.browserSessionId,
         interval.tabId, interval.startedAt, interval.endedAt, interval.durationMs, interval.url,
         interval.canonicalUrl, interval.domain, interval.title, interval.terminationReason,
@@ -339,7 +470,7 @@ export class ActivityStore {
         episode.uniqueDomains, episode.uniqueUrls, episode.tabSwitchCount,
         episode.domainSwitchCount, episode.ideaCount, outputCounts.get(episode.episodeId) ?? 0,
         episode.derivationVersion, JSON.stringify(episode.evidence),
-        JSON.stringify({ intervalIds: episode.intervalIds }),
+        JSON.stringify({ intervalIds: episode.intervalIds, topicLabelSource: episode.topicLabelSource }),
       );
       for (const idea of ideas) {
         const episode = episodes.find((candidate) => idea.capturedAt >= candidate.startedAt && idea.capturedAt <= candidate.endedAt);
@@ -348,10 +479,30 @@ export class ActivityStore {
       for (const link of outputLinks) insertOutputLink.run(
         link.outputId, link.episodeId, link.gapMs, link.reason, link.associationVersion,
       );
-      this.database.prepare(`
-        DELETE FROM annotations WHERE episode_id IS NOT NULL
-          AND episode_id NOT IN (SELECT episode_id FROM research_episodes)
-      `).run();
+      const episodeIds = new Set(episodes.map((episode) => episode.episodeId));
+      for (const annotation of annotations) {
+        const matched = episodeIds.has(annotation.episodeId)
+          ? episodes.find((episode) => episode.episodeId === annotation.episodeId) ?? null
+          : bestEpisodeForAnnotation(annotation, episodes, options.pruneOrphanAnnotations);
+        if (matched) {
+          const reassociated: EpisodeAnnotation = {
+            ...annotation,
+            episodeId: matched.episodeId,
+            anchorIntervalIds: annotation.anchorIntervalIds.length ? annotation.anchorIntervalIds : matched.intervalIds,
+            anchorStartedAt: annotation.anchorStartedAt ?? matched.startedAt,
+            anchorEndedAt: annotation.anchorEndedAt ?? matched.endedAt,
+          };
+          updateAnnotation.run(reassociated.episodeId, JSON.stringify(annotationEvidence(reassociated)), reassociated.annotationId);
+        } else if (options.pruneOrphanAnnotations) {
+          deleteAnnotation.run(annotation.annotationId);
+        }
+      }
+      if (options.pruneOrphanAnnotations) {
+        this.database.exec(`
+          DELETE FROM episode_corrections
+          WHERE anchor_interval_id NOT IN (SELECT interval_id FROM active_intervals)
+        `);
+      }
       this.database.prepare(`
         INSERT INTO derivation_runs(derivation_version, completed_at, input_event_count, interval_count, episode_count)
         VALUES (1, ?, ?, ?, ?)
@@ -360,7 +511,7 @@ export class ActivityStore {
           input_event_count = excluded.input_event_count,
           interval_count = excluded.interval_count,
           episode_count = excluded.episode_count
-      `).run(new Date().toISOString(), events.length, intervals.length, episodes.length);
+      `).run(new Date().toISOString(), this.countRows("activity_events"), intervals.length, episodes.length);
       this.database.exec("COMMIT");
     } catch (error) {
       this.database.exec("ROLLBACK");
@@ -369,22 +520,31 @@ export class ActivityStore {
     return { intervals: intervals.length, episodes: episodes.length, outputLinks: outputLinks.length };
   }
 
-  getDailySummary(date: string): DailySummary {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error("Date must use YYYY-MM-DD");
-    const start = `${date}T00:00:00.000Z`;
-    const end = new Date(Date.parse(start) + 24 * 60 * 60_000).toISOString();
-    const intervals = (this.database.prepare(`
-      SELECT * FROM active_intervals WHERE started_at < ? AND ended_at >= ? ORDER BY started_at
+  getDailySummary(date: string, timeZone = "UTC"): DailySummary {
+    const calendarWindow = calendarDayWindow(date, timeZone);
+    const { start, end } = calendarWindow;
+    const storedIntervals = (this.database.prepare(`
+      SELECT * FROM active_intervals WHERE started_at < ? AND ended_at > ? ORDER BY started_at
     `).all(end, start) as Array<Record<string, unknown>>).map(rowToInterval);
-    const episodes = (this.database.prepare(`
-      SELECT * FROM research_episodes WHERE started_at < ? AND ended_at >= ? ORDER BY started_at
+    const storedEpisodes = (this.database.prepare(`
+      SELECT * FROM research_episodes WHERE started_at < ? AND ended_at > ? ORDER BY started_at
     `).all(end, start) as Array<Record<string, unknown>>).map(rowToEpisode);
+    const projection = projectActivityWindow(storedIntervals, storedEpisodes, calendarWindow);
+    const intervals = projection.intervals;
+    let episodes = projection.episodes;
     const ideas = this.readIdeas(start, end);
     const episodeIds = new Set(episodes.map((episode) => episode.episodeId));
     const outputs = this.readOutputs().filter((output) =>
       (output.occurredAt >= start && output.occurredAt < end) || (output.episodeId !== null && episodeIds.has(output.episodeId)),
     );
     const annotations = this.readAnnotations().filter((annotation) => episodeIds.has(annotation.episodeId));
+    const intervalIds = new Set(intervals.map((interval) => interval.intervalId));
+    const corrections = this.readEpisodeCorrections().filter((correction) => intervalIds.has(correction.anchorIntervalId));
+    episodes = episodes.map((episode) => ({
+      ...episode,
+      ideaCount: ideas.filter((idea) => idea.episodeId === episode.episodeId).length,
+      outputCount: outputs.filter((output) => output.episodeId === episode.episodeId).length,
+    }));
     const boundaries = (this.database.prepare(`
       SELECT event_type, occurred_at, idle_state FROM activity_events
       WHERE occurred_at >= ? AND occurred_at < ?
@@ -407,10 +567,12 @@ export class ActivityStore {
     const domainSwitchCount = episodes.reduce((sum, episode) => sum + episode.domainSwitchCount, 0);
     return {
       date,
+      timeZone,
+      window: { start, end },
       metrics: {
         activeDurationMs,
         ideaCount: ideas.length,
-        outputCount: outputs.length,
+        outputCount: outputs.filter((output) => output.occurredAt >= start && output.occurredAt < end).length,
         tabSwitchCount,
         domainSwitchCount,
         contextSwitchesPerActiveHour: activeDurationMs > 0
@@ -426,6 +588,7 @@ export class ActivityStore {
       ideas,
       outputs,
       annotations,
+      corrections,
       boundaries,
       caveats: [
         "Active time is observed foreground activity, not a productivity judgement.",
@@ -435,23 +598,23 @@ export class ActivityStore {
     };
   }
 
-  getRangeSummary(from: string, days: number): Record<string, unknown> {
+  getRangeSummary(from: string, days: number, timeZone = "UTC"): Record<string, unknown> {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !Number.isInteger(days) || days < 1 || days > 31) {
       throw new Error("Range requires YYYY-MM-DD and 1-31 days");
     }
-    const daily = Array.from({ length: days }, (_, index) => {
-      const date = new Date(Date.parse(`${from}T00:00:00.000Z`) + index * 24 * 60 * 60_000).toISOString().slice(0, 10);
-      return this.getDailySummary(date);
-    });
+    const daily = Array.from({ length: days }, (_, index) => this.getDailySummary(addCalendarDays(from, index), timeZone));
     const domainTotals = new Map<string, number>();
     const topics = new Map<string, number>();
     const focusDurations: number[] = [];
     const revisits = new Map<string, { url: string; title: string | null; visits: number }>();
+    const seenIntervals = new Set<string>();
     for (const day of daily) {
       for (const domain of day.topDomains) domainTotals.set(domain.domain, (domainTotals.get(domain.domain) ?? 0) + domain.activeDurationMs);
       for (const episode of day.episodes) topics.set(episode.topicLabel, (topics.get(episode.topicLabel) ?? 0) + episode.activeDurationMs);
       focusDurations.push(...day.focusPeriods.map((period) => period.durationMs));
       for (const interval of day.intervals) {
+        if (seenIntervals.has(interval.intervalId)) continue;
+        seenIntervals.add(interval.intervalId);
         const url = interval.canonicalUrl ?? interval.url;
         if (!url) continue;
         const existing = revisits.get(url) ?? { url, title: interval.title, visits: 0 };
@@ -462,10 +625,14 @@ export class ActivityStore {
     const activeDurationMs = daily.reduce((sum, day) => sum + day.metrics.activeDurationMs, 0);
     const tabSwitchCount = daily.reduce((sum, day) => sum + day.metrics.tabSwitchCount, 0);
     const domainSwitchCount = daily.reduce((sum, day) => sum + day.metrics.domainSwitchCount, 0);
-    const activityByHour = bucketActiveByHour(daily.flatMap((day) => day.intervals));
+    const activityByHour = bucketActiveByLocalHour(daily.flatMap((day) => day.intervals), timeZone);
+    const outputsInRange = new Map(daily.flatMap((day) => day.outputs
+      .filter((output) => output.occurredAt >= day.window.start && output.occurredAt < day.window.end)
+      .map((output) => [output.outputId, output] as const)));
     return {
       from,
       days,
+      timeZone,
       daily: daily.map((day) => ({ date: day.date, ...day.metrics })),
       metrics: {
         activeDurationMs,
@@ -473,8 +640,8 @@ export class ActivityStore {
         tabSwitchCount,
         domainSwitchCount,
         ideaCount: daily.reduce((sum, day) => sum + day.metrics.ideaCount, 0),
-        outputCount: daily.reduce((sum, day) => sum + day.metrics.outputCount, 0),
-        outputLinkedEpisodeCount: new Set(daily.flatMap((day) => day.outputs.map((output) => output.episodeId).filter(Boolean))).size,
+        outputCount: outputsInRange.size,
+        outputLinkedEpisodeCount: new Set([...outputsInRange.values()].map((output) => output.episodeId).filter(Boolean)).size,
         contextSwitchesPerActiveHour: activeDurationMs ? ((tabSwitchCount + domainSwitchCount) * 3_600_000) / activeDurationMs : 0,
       },
       topDomains: [...domainTotals.entries()].map(([domain, durationMs]) => ({ domain, activeDurationMs: durationMs })).sort((a, b) => b.activeDurationMs - a.activeDurationMs).slice(0, 12),
@@ -510,6 +677,26 @@ export class ActivityStore {
   readActivityEvents(): PersistedActivityEvent[] {
     const rows = this.database.prepare("SELECT * FROM activity_events ORDER BY occurred_at, rowid").all() as Array<Record<string, unknown>>;
     return rows.map(rowToEvent);
+  }
+
+  private readActivityEventsForSessions(sessionIds: readonly string[]): PersistedActivityEvent[] {
+    const placeholders = sessionIds.map(() => "?").join(",");
+    const rows = this.database.prepare(`
+      SELECT * FROM activity_events
+      WHERE browser_session_id IN (${placeholders})
+      ORDER BY occurred_at, rowid
+    `).all(...sessionIds) as Array<Record<string, unknown>>;
+    return rows.map(rowToEvent);
+  }
+
+  private readStoredIntervalsExcept(sessionIds: readonly string[]): ActiveInterval[] {
+    const placeholders = sessionIds.map(() => "?").join(",");
+    const rows = this.database.prepare(`
+      SELECT * FROM active_intervals
+      WHERE browser_session_id NOT IN (${placeholders})
+      ORDER BY started_at
+    `).all(...sessionIds) as Array<Record<string, unknown>>;
+    return rows.map(rowToInterval);
   }
 
   readIdeas(from?: string, to?: string): CapturedIdea[] {
@@ -551,13 +738,33 @@ export class ActivityStore {
 
   readAnnotations(): EpisodeAnnotation[] {
     const rows = this.database.prepare("SELECT * FROM annotations ORDER BY created_at").all() as Array<Record<string, unknown>>;
+    return rows.map(rowToAnnotation);
+  }
+
+  readEpisodeCorrections(): EpisodeCorrection[] {
+    const rows = this.database.prepare("SELECT * FROM episode_corrections ORDER BY created_at").all() as Array<Record<string, unknown>>;
     return rows.map((row) => ({
-      annotationId: String(row.annotation_id),
+      correctionId: String(row.correction_id),
       createdAt: String(row.created_at),
-      episodeId: String(row.episode_id),
-      label: String(row.label) as EpisodeAnnotationLabel,
-      note: nullableString(row.note),
+      correctionType: String(row.correction_type) as EpisodeCorrectionType,
+      anchorIntervalId: String(row.anchor_interval_id),
+      label: nullableString(row.label),
     }));
+  }
+
+  private readAnnotationsWithCurrentEpisodeEvidence(): EpisodeAnnotation[] {
+    return this.readAnnotations().map((annotation) => {
+      if (annotation.anchorIntervalIds.length || annotation.anchorStartedAt || annotation.anchorEndedAt) return annotation;
+      const row = this.database.prepare("SELECT * FROM research_episodes WHERE episode_id = ?").get(annotation.episodeId) as Record<string, unknown> | undefined;
+      if (!row) return annotation;
+      const episode = rowToEpisode(row);
+      return {
+        ...annotation,
+        anchorIntervalIds: episode.intervalIds,
+        anchorStartedAt: episode.startedAt,
+        anchorEndedAt: episode.endedAt,
+      };
+    });
   }
 
   deleteData(filter: DeleteFilter): DeleteReport {
@@ -628,7 +835,7 @@ export class ActivityStore {
       this.database.exec("ROLLBACK");
       throw error;
     }
-    this.rebuildDerivations();
+    this.rebuildDerivationsInternal({ associationOptions: {}, pruneOrphanAnnotations: true });
     return { activityEventsDeleted, historicalUrlsDeleted, historicalVisitsDeleted, ideasDeleted };
   }
 
@@ -672,7 +879,19 @@ export class ActivityStore {
       capturedIdeas: this.readIdeas(),
       outputs: this.readOutputs(),
       annotations: this.readAnnotations(),
+      episodeCorrections: this.readEpisodeCorrections(),
     };
+  }
+
+  createAnalysisExport(options: AnalysisExportOptions): AnalysisExportArtifact {
+    const dates = calendarDates(options.from, options.to, 90);
+    const days = dates.map((date) => this.getDailySummary(date, options.timeZone));
+    return renderAnalysisExport(days, options);
+  }
+
+  private countRows(table: "activity_events"): number {
+    const row = this.database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number };
+    return Number(row.count);
   }
 
   close(): void {
@@ -734,6 +953,7 @@ function rowToEpisode(row: Record<string, unknown>): ResearchEpisode {
     endedAt: String(row.ended_at),
     topicLabel: String(row.topic_label ?? "unlabelled research"),
     topicConfidence: Number(row.topic_confidence ?? 0),
+    topicLabelSource: metadata.topicLabelSource === "user" ? "user" : "deterministic",
     activeDurationMs: Number(row.active_duration_ms),
     idleDurationMs: Number(row.idle_duration_ms),
     uniqueDomains: Number(row.unique_domains),
@@ -748,6 +968,70 @@ function rowToEpisode(row: Record<string, unknown>): ResearchEpisode {
       ? metadata.intervalIds.filter((value): value is string => typeof value === "string")
       : [],
   };
+}
+
+function rowToAnnotation(row: Record<string, unknown>): EpisodeAnnotation {
+  const evidence = parseObject(row.evidence_json);
+  return {
+    annotationId: String(row.annotation_id),
+    createdAt: String(row.created_at),
+    episodeId: String(row.episode_id),
+    label: String(row.label) as EpisodeAnnotationLabel,
+    note: nullableString(row.note),
+    anchorIntervalIds: Array.isArray(evidence.intervalIds)
+      ? evidence.intervalIds.filter((value): value is string => typeof value === "string")
+      : [],
+    anchorStartedAt: nullableString(evidence.startedAt),
+    anchorEndedAt: nullableString(evidence.endedAt),
+  };
+}
+
+function annotationEvidence(annotation: EpisodeAnnotation): Record<string, unknown> {
+  return {
+    intervalIds: annotation.anchorIntervalIds,
+    startedAt: annotation.anchorStartedAt,
+    endedAt: annotation.anchorEndedAt,
+  };
+}
+
+function bestEpisodeForAnnotation(
+  annotation: EpisodeAnnotation,
+  episodes: ResearchEpisode[],
+  requireSharedInterval: boolean,
+): ResearchEpisode | null {
+  const anchorIds = new Set(annotation.anchorIntervalIds);
+  const anchorStart = annotation.anchorStartedAt ? Date.parse(annotation.anchorStartedAt) : Number.NaN;
+  const anchorEnd = annotation.anchorEndedAt ? Date.parse(annotation.anchorEndedAt) : Number.NaN;
+  let best: { episode: ResearchEpisode; sharedIntervals: number; overlapMs: number } | null = null;
+  for (const episode of episodes) {
+    const sharedIntervals = episode.intervalIds.filter((intervalId) => anchorIds.has(intervalId)).length;
+    const overlapMs = Number.isFinite(anchorStart) && Number.isFinite(anchorEnd)
+      ? Math.max(0, Math.min(anchorEnd, Date.parse(episode.endedAt)) - Math.max(anchorStart, Date.parse(episode.startedAt)))
+      : 0;
+    if (sharedIntervals === 0 && (requireSharedInterval || overlapMs === 0)) continue;
+    if (!best || sharedIntervals > best.sharedIntervals || (sharedIntervals === best.sharedIntervals && overlapMs > best.overlapMs)) {
+      best = { episode, sharedIntervals, overlapMs };
+    }
+  }
+  return best?.episode ?? null;
+}
+
+function applySchemaMigrations(database: DatabaseSync): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL
+    )
+  `);
+  const columns = database.prepare("PRAGMA table_info(annotations)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "evidence_json")) {
+    database.exec("ALTER TABLE annotations ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '{}'");
+  }
+  const insert = database.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)");
+  const appliedAt = new Date().toISOString();
+  insert.run(1, appliedAt);
+  insert.run(2, appliedAt);
+  insert.run(3, appliedAt);
 }
 
 function parseObject(value: unknown): Record<string, unknown> {
@@ -779,22 +1063,6 @@ function median(values: number[]): number {
   const ordered = [...values].sort((left, right) => left - right);
   const middle = Math.floor(ordered.length / 2);
   return ordered.length % 2 ? ordered[middle]! : (ordered[middle - 1]! + ordered[middle]!) / 2;
-}
-
-function bucketActiveByHour(intervals: ActiveInterval[]): number[] {
-  const buckets = Array.from({ length: 24 }, () => 0);
-  for (const interval of intervals) {
-    let cursor = Date.parse(interval.startedAt);
-    const end = Date.parse(interval.endedAt);
-    while (cursor < end) {
-      const current = new Date(cursor);
-      const nextHour = Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), current.getUTCDate(), current.getUTCHours() + 1);
-      const segmentEnd = Math.min(end, nextHour);
-      buckets[current.getUTCHours()]! += segmentEnd - cursor;
-      cursor = segmentEnd;
-    }
-  }
-  return buckets;
 }
 
 export const INITIAL_SCHEMA = `
@@ -934,8 +1202,18 @@ CREATE TABLE IF NOT EXISTS annotations (
   created_at TEXT NOT NULL,
   episode_id TEXT,
   label TEXT,
-  note TEXT
+  note TEXT,
+  evidence_json TEXT NOT NULL DEFAULT '{}'
 );
+
+CREATE TABLE IF NOT EXISTS episode_corrections (
+  correction_id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  correction_type TEXT NOT NULL,
+  anchor_interval_id TEXT NOT NULL,
+  label TEXT
+);
+CREATE INDEX IF NOT EXISTS episode_corrections_anchor_idx ON episode_corrections(anchor_interval_id);
 
 CREATE TABLE IF NOT EXISTS outputs (
   output_id TEXT PRIMARY KEY,
@@ -970,5 +1248,10 @@ CREATE TABLE IF NOT EXISTS derivation_runs (
   input_event_count INTEGER NOT NULL,
   interval_count INTEGER NOT NULL,
   episode_count INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version INTEGER PRIMARY KEY,
+  applied_at TEXT NOT NULL
 );
 `;
