@@ -29,6 +29,7 @@ Selected local calendar range
 - `privacy`: turns an untrusted URL or activity event into a persistable observation or an excluded transition marker.
 - `browser-history-import`: discovers profiles and imports a safe snapshot through one `importProfile` interface.
 - `database`: owns migrations, idempotent writes, annotations, output links, deletion, export, and dashboard reads.
+- `review`: derives deterministic review items from episodes, annotations, ideas, and outputs while preserving evidence references.
 - `sessionisation`: turns ordered events into active intervals, focus periods, and explainable research episodes.
 - `calendar-analysis`: projects UTC intervals and episodes into DST-safe local calendar windows and clips evidence at window edges.
 - `analysis-pack`: turns selected daily evidence into token-budgeted aggregate, contextual, or detailed records and renders Markdown/JSONL adapters.
@@ -44,6 +45,8 @@ The collector exposes `/api/diagnostics/connection` as an authenticated health c
 Privacy configuration is owned by the collector and retrieved through `/api/privacy/config`. The extension stores the last verified remote version and applies a restrictive union with its local rules before queueing. The collector applies its canonical rules again before persistence. This preserves bounded offline delivery while ensuring a stale or less restrictive extension cache cannot weaken persistence privacy.
 
 Range summaries accept explicit calendar-week, calendar-month, rolling-7, rolling-30, and custom modes. Local calendar boundaries are converted to UTC through `calendar-analysis` before database queries. Git collection uses the same local-day window, so output evidence and activity evidence share calendar semantics.
+
+The authenticated `/api/overview` route combines a selected range summary with an equal-length preceding-period comparison, evidence coverage, deterministic review items, recent ideas and outputs, and resume candidates. Review navigation returns to the day evidence surface; it does not turn associations or missing records into productivity judgements.
 
 Complexity is kept behind these interfaces. SQLite, the filesystem, Chrome APIs, HTTP, time, and Git are adapters at real seams; domain tests exercise public behavior rather than private helpers.
 

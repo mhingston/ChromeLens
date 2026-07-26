@@ -14,7 +14,8 @@ const evidenceDrawer = document.querySelector<HTMLDialogElement>("#evidence-draw
 const evidenceDrawerContent = document.querySelector<HTMLElement>("#evidence-drawer-content")!;
 const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 let token = localStorage.getItem("chromelens-token") ?? "";
-let view = "day";
+let view = "overview";
+let pendingEvidenceTarget: { intervalId?: string; episodeId?: string; outputId?: string; ideaId?: string } | null = null;
 dateInput.value = localCalendarDate(new Date());
 rangeModeInput.value = "calendar_week";
 customFromInput.value = shiftCalendarDate(dateInput.value, -6);
@@ -41,7 +42,7 @@ document.querySelector<HTMLFormElement>("#token-form")!.addEventListener("submit
 
 async function load(): Promise<void> {
   const titles: Record<string, [string,string]> = {
-    day:["DAILY LENS","A day in context."], week:["WEEKLY PATTERNS","Seven days, observed."],
+    overview:["OVERVIEW","What needs attention, and where to resume."], day:["EXPLORE / DAY","A day in context."], week:["PATTERNS / WEEK","Seven days, observed."],
     month:["MONTHLY PATTERNS","A calendar month, observed."], settings:["LOCAL CONTROLS","Privacy & data."],
   };
   document.querySelector("#view-kicker")!.textContent = titles[view]![0];
@@ -54,7 +55,8 @@ async function load(): Promise<void> {
   try {
     if (!token) return requireToken();
     await refreshCollectorStatus();
-    if (view === "day") renderDay(await api(`/api/summary/daily?date=${dateInput.value}&timezone=${encodeURIComponent(timeZone)}`));
+    if (view === "overview") renderOverview(await api(overviewQuery()));
+    else if (view === "day") renderDay(await api(`/api/summary/daily?date=${dateInput.value}&timezone=${encodeURIComponent(timeZone)}`));
     else if (view === "week" || view === "month") renderRange(await api(rangeQuery()));
     else await renderSettings();
   } catch (error) {
@@ -84,8 +86,131 @@ function rangeQuery(): string {
   return `/api/summary/range?from=${range.from}&to=${range.to}&days=${range.dates.length}&mode=${mode}&timezone=${encodeURIComponent(timeZone)}`;
 }
 
+function overviewQuery(): string {
+  const mode = rangeModeInput.value as CalendarRangeMode;
+  const range = mode === "custom"
+    ? calendarRange(dateInput.value, timeZone, mode, customFromInput.value, customToInput.value)
+    : calendarRange(dateInput.value, timeZone, mode);
+  return `/api/overview?from=${range.from}&to=${range.to}&days=${range.dates.length}&mode=${mode}&timezone=${encodeURIComponent(timeZone)}`;
+}
+
 function syncRangeControls(): void {
   customRange.hidden = view === "day" || view === "settings" || rangeModeInput.value !== "custom";
+}
+
+function renderOverview(data: Json): void {
+  const summary = data.summary;
+  const coverage = data.coverage;
+  const metrics = el("section", "metric-grid");
+  metrics.append(
+    metric("Observed days", `${coverage.daysWithActivity} / ${coverage.observedDays}`, "Days with prospective intervals"),
+    metric("Active foreground", duration(coverage.activeDurationMs), "Observed, not scored"),
+    metric("Review items", String(data.reviewItems.length), "Evidence and coverage checks"),
+    metric("Historical visits", String(coverage.historicalVisits), "Separate historical evidence"),
+  );
+  const grid = el("section", "grid");
+  grid.append(reviewInboxCard(data.reviewItems), comparisonCard(summary, data.previousSummary, data.period), resumeCard(data.resumeCandidates), recentIdeasCard(data.recentIdeas), recentOutputsCard(data.recentOutputs));
+  content.replaceChildren(metrics, grid);
+  if (!data.reviewItems.length) showNotice("No review items were derived for this range.");
+}
+
+function reviewInboxCard(items: Json[]): HTMLElement {
+  const card = cardShell("Review inbox", items.length ? `${items.length} item(s) have supporting evidence or a coverage limitation.` : "Evidence is currently connected and no review items were derived.", "wide");
+  const actions = el("div", "actions");
+  if (items.length) {
+    const next = el("button", "primary", "Review next item");
+    next.type = "button";
+    next.addEventListener("click", () => navigateToReviewItem(items[0]!));
+    actions.append(next);
+  }
+  const list = scrollRegion(el("div", "review-list"), "Review inbox", "tall");
+  if (!items.length) list.append(empty("Nothing currently needs review."));
+  items.forEach((item: Json) => {
+    const row = el("article", "review-item");
+    const button = el("button", "review-item-button");
+    button.type = "button";
+    button.append(el("strong", "", item.title), el("span", "", item.statement));
+    button.addEventListener("click", () => navigateToReviewItem(item));
+    row.append(button, el("small", "", item.priority === "review" ? "Review" : "Information"));
+    list.append(row);
+  });
+  card.append(actions, list);
+  return card;
+}
+
+function comparisonCard(current: Json, previous: Json, period: Json): HTMLElement {
+  const card = cardShell("Previous-period comparison", `${period.from}–${period.to} compared with the preceding equal-length period. Both are ${period.timeZone}.`);
+  const list = el("div", "comparison-list");
+  const metrics: Array<[string, number, number, (value: number) => string]> = [
+    ["Active foreground", current.metrics.activeDurationMs, previous.metrics.activeDurationMs, duration],
+    ["Tab transitions", current.metrics.tabSwitchCount, previous.metrics.tabSwitchCount, (value) => String(value)],
+    ["Domain transitions", current.metrics.domainSwitchCount, previous.metrics.domainSwitchCount, (value) => String(value)],
+    ["Unique context boundaries", current.metrics.uniqueContextBoundaryCount, previous.metrics.uniqueContextBoundaryCount, (value) => String(value)],
+  ];
+  metrics.forEach(([label, currentValue, previousValue, format]) => {
+    const row = el("div", "comparison-row");
+    row.append(el("span", "", label), el("strong", "", format(currentValue)), el("small", "", `previous ${format(previousValue)} · difference ${format(currentValue - previousValue)}`));
+    list.append(row);
+  });
+  card.append(list);
+  return card;
+}
+
+function resumeCard(candidates: Json[]): HTMLElement {
+  const card = cardShell("Resume candidates", "Deterministic continuity signals, not a claim that anything is unfinished.");
+  const list = scrollRegion(el("div", "resume-list"), "Resume candidates");
+  if (!candidates.length) list.append(empty("No explicit idea-without-output candidates in this range."));
+  candidates.forEach((candidate: Json) => {
+    const button = el("button", "resume-item");
+    button.type = "button";
+    button.append(el("strong", "", candidate.topicLabel), el("span", "", `${candidate.date} · ${duration(candidate.activeDurationMs)} · ${candidate.reason}`));
+    button.addEventListener("click", () => navigateToReviewItem({ target: candidate.episodeId, date: candidate.date }));
+    list.append(button);
+  });
+  card.append(list);
+  return card;
+}
+
+function recentIdeasCard(ideas: Json[]): HTMLElement {
+  const card = cardShell("Recent ideas", "Explicitly captured thoughts in this range.");
+  const list = scrollRegion(el("div", "idea-list"), "Recent ideas");
+  if (!ideas.length) list.append(empty("No ideas captured in this range."));
+  ideas.forEach((idea: Json) => {
+    const item = el("article", "idea");
+    item.id = `idea-${idea.ideaId}`;
+    item.append(el("p", "", idea.text), el("small", "", `${clock(idea.capturedAt)}${idea.episodeId ? " · linked to episode" : " · not associated"}`));
+    list.append(item);
+  });
+  card.append(list);
+  return card;
+}
+
+function recentOutputsCard(outputs: Json[]): HTMLElement {
+  const card = cardShell("Recent outputs", "Local connector evidence in this range.");
+  const list = scrollRegion(el("div", "output-list"), "Recent outputs");
+  if (!outputs.length) list.append(empty("No local outputs collected in this range."));
+  outputs.forEach((output: Json) => {
+    const item = el("article", "output");
+    item.id = `output-${output.outputId}`;
+    item.append(el("strong", "", output.title || output.reference || "Untitled output"), el("small", "", `${clock(output.occurredAt)} · ${output.episodeId ? "linked to episode" : "not linked"}`));
+    list.append(item);
+  });
+  card.append(list);
+  return card;
+}
+
+function navigateToReviewItem(item: Json): void {
+  if (item.date) dateInput.value = item.date;
+  if (item.kind === "unlinked_output") pendingEvidenceTarget = { outputId: item.target };
+  else if (item.kind === "unassociated_idea") pendingEvidenceTarget = { ideaId: item.target };
+  else if (item.target?.startsWith("ep_") || item.target?.startsWith("episode")) pendingEvidenceTarget = { episodeId: item.target };
+  view = "day";
+  updateActiveNav("day");
+  void load();
+}
+
+function updateActiveNav(activeView: string): void {
+  document.querySelectorAll<HTMLButtonElement>(".nav-button").forEach((item) => item.classList.toggle("active", item.dataset.view === activeView));
 }
 
 function renderDay(data: Json): void {
@@ -101,6 +226,16 @@ function renderDay(data: Json): void {
   const grid = el("section", "grid");
   grid.append(timelineCard(data), focusCard(data.focusPeriods), boundariesCard(data.boundaries), domainsCard(data.topDomains), episodesCard(data.episodes,data.outputs,data.annotations,data.corrections??[],data.intervals,data.ideas), ideasCard(data.ideas), outputsCard(data.outputs));
   content.replaceChildren(metrics, grid);
+  if (pendingEvidenceTarget) {
+    const target = pendingEvidenceTarget;
+    pendingEvidenceTarget = null;
+    if (target.intervalId) {
+      const interval = data.intervals.find((candidate: Json) => candidate.intervalId === target.intervalId);
+      if (interval) openEvidenceDrawer(interval, data);
+    } else if (target.episodeId) focusEpisode(target.episodeId);
+    else if (target.outputId) focusRecord(`output-${target.outputId}`);
+    else if (target.ideaId) focusRecord(`idea-${target.ideaId}`);
+  }
   if (!data.intervals.length) showNotice("No prospective activity intervals for this day. Historical visits cannot be presented as active attention.");
 }
 
@@ -175,6 +310,14 @@ function focusEpisode(episodeId: string, selector = "episode-details", openDetai
   if (details && openDetails) details.open = true;
   episode.scrollIntoView({ behavior: "smooth", block: "start" });
   if (details && !openDetails) details.open = true;
+}
+
+function focusRecord(id: string): void {
+  const record = document.getElementById(id);
+  if (!record) return;
+  record.tabIndex = -1;
+  record.scrollIntoView({ behavior: "smooth", block: "center" });
+  record.focus({ preventScroll: true });
 }
 
 function domainsCard(domains: Json[]): HTMLElement {
@@ -425,7 +568,7 @@ function annotationEditor(episode: Json): HTMLElement {
   return editor;
 }
 
-function outputsCard(outputs:Json[]):HTMLElement{const card=cardShell("Linked outputs","Local Git commits associated by time; proximity is evidence, not causation.");const list=scrollRegion(el("div","output-list"),"Linked outputs");if(!outputs.length)list.append(empty("No local outputs collected for this day."));outputs.forEach((output)=>{const item=el("article","output");item.append(el("strong","",output.title||"Untitled output"),el("small","",`${clock(output.occurredAt)} · ${output.repository||output.sourceConnector}${output.reference?` · ${String(output.reference).slice(0,8)}`:""}`),el("p","",output.associationReason||"Not linked to an episode"));list.append(item)});card.append(list);return card}
+function outputsCard(outputs:Json[]):HTMLElement{const card=cardShell("Linked outputs","Local Git commits associated by time; proximity is evidence, not causation.");const list=scrollRegion(el("div","output-list"),"Linked outputs");if(!outputs.length)list.append(empty("No local outputs collected for this day."));outputs.forEach((output)=>{const item=el("article","output");item.id=`output-${output.outputId}`;item.append(el("strong","",output.title||"Untitled output"),el("small","",`${clock(output.occurredAt)} · ${output.repository||output.sourceConnector}${output.reference?` · ${String(output.reference).slice(0,8)}`:""}`),el("p","",output.associationReason||"Not linked to an episode"));list.append(item)});card.append(list);return card}
 
 function focusCard(periods:FocusPeriodView[]):HTMLElement{const contexts=summarizeFocusPeriods(periods);const card=cardShell("Focus by context","Total observed foreground time across distinct focus periods.");const list=scrollRegion(el("div","bar-list"),"Focus by context");const max=Math.max(1,...contexts.map((context)=>context.durationMs));if(!contexts.length)list.append(empty("No focus periods derived."));contexts.slice(0,10).forEach((context)=>list.append(barRow(context.domain||"Mixed context",duration(context.durationMs),context.durationMs/max,countLabel(context.periodCount,"period"))));card.append(list);return card}
 
@@ -434,7 +577,7 @@ function boundariesCard(boundaries:Json[]):HTMLElement{const card=cardShell("Sta
 function ideasCard(ideas: Json[]): HTMLElement {
   const card = cardShell("Captured ideas", "Explicit thoughts, linked to their browsing context."); const list = scrollRegion(el("div","idea-list"), "Captured ideas");
   if (!ideas.length) list.append(empty("No ideas captured on this day."));
-  ideas.forEach((idea) => { const item=el("article","idea"); item.append(el("p","",idea.text),el("small","",`${clock(idea.capturedAt)}${idea.episodeId?" · linked to episode":""}`)); const tags=el("div",""); idea.tags.forEach((tag:string)=>tags.append(el("span","tag",tag))); item.append(tags); list.append(item); });
+  ideas.forEach((idea) => { const item=el("article","idea"); item.id=`idea-${idea.ideaId}`; item.append(el("p","",idea.text),el("small","",`${clock(idea.capturedAt)}${idea.episodeId?" · linked to episode":""}`)); const tags=el("div",""); idea.tags.forEach((tag:string)=>tags.append(el("span","tag",tag))); item.append(tags); list.append(item); });
   card.append(list); return card;
 }
 
@@ -550,7 +693,7 @@ function downloadPreviewedArtifact(artifact:Json):void{const blob=new Blob([arti
 function analysisExportQuery(values:{from:string;to:string;privacy:string;format:string;maxTokens:string}):string{const query=new URLSearchParams({format:`llm-${values.format}`,from:values.from,to:values.to,timezone:timeZone,privacy:values.privacy,maxTokens:values.maxTokens});return query.toString()}
 async function api(path:string,init:RequestInit={}):Promise<Json>{return requestApi(path,token,init)}
 function requireToken():void { if(!tokenDialog.open)tokenDialog.showModal();content.replaceChildren(el("div","empty","Enter the local collector token to view data.")); }
-function periodStep():number{if(view==="day")return 1;if(view==="week")return rangeModeInput.value==="rolling_30"?30:rangeModeInput.value==="rolling_7"?7:rangeModeInput.value==="calendar_month"?1:7;return 1}
+function periodStep():number{if(view==="day")return 1;if(view==="week"||view==="overview")return rangeModeInput.value==="rolling_30"?30:rangeModeInput.value==="rolling_7"?7:rangeModeInput.value==="calendar_month"?1:7;return 1}
 function shiftDate(days:number):void{if(view==="month"||rangeModeInput.value==="calendar_month")dateInput.value=shiftCalendarMonth(dateInput.value,days);else dateInput.value=shiftCalendarDate(dateInput.value,days);void load()}
 function el<K extends keyof HTMLElementTagNameMap>(tag:K,className="",text=""):HTMLElementTagNameMap[K]{const node=document.createElement(tag);if(className)node.className=className;if(text)node.textContent=text;return node} function empty(text:string){return el("div","empty",text)}
 function scrollRegion<T extends HTMLElement>(node:T,label:string,size:"standard"|"tall"="standard"):T{node.classList.add("scroll-region");if(size==="tall")node.classList.add("scroll-region-tall");node.tabIndex=0;node.setAttribute("role","region");node.setAttribute("aria-label",label);return node}

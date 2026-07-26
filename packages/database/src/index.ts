@@ -35,6 +35,7 @@ import {
   type AnalysisExportArtifact,
   type AnalysisExportOptions,
 } from "../../analysis-pack/src/index.ts";
+import { buildReviewItems } from "../../review/src/index.ts";
 
 export interface IngestionReport {
   received: number;
@@ -677,6 +678,51 @@ export class ActivityStore {
     };
   }
 
+  getOverview(
+    from: string,
+    days: number,
+    timeZone = "UTC",
+    options: { mode?: CalendarRangeMode; to?: string } = {},
+  ): Record<string, unknown> {
+    const range = options.mode
+      ? calendarRange(from, timeZone, options.mode, options.mode === "custom" ? from : undefined, options.mode === "custom" ? options.to : undefined)
+      : calendarRange(from, timeZone, "custom", from, addCalendarDays(from, days - 1));
+    const daily = range.dates.map((date) => this.getDailySummary(date, timeZone));
+    const episodes = uniqueById(daily.flatMap((day) => day.episodes), (episode) => episode.episodeId);
+    const outputs = uniqueById(daily.flatMap((day) => day.outputs), (output) => output.outputId);
+    const ideas = uniqueById(daily.flatMap((day) => day.ideas), (idea) => idea.ideaId);
+    const annotations = uniqueById(daily.flatMap((day) => day.annotations), (annotation) => annotation.annotationId);
+    const current = this.getRangeSummary(range.from, range.dates.length, timeZone, { mode: "custom", to: range.to });
+    const previousFrom = addCalendarDays(range.from, -range.dates.length);
+    const previousTo = addCalendarDays(previousFrom, range.dates.length - 1);
+    const previous = this.getRangeSummary(previousFrom, range.dates.length, timeZone, { mode: "custom", to: previousTo });
+    const latestEventAt = this.getLastObservedEventAt();
+    const reviewItems = buildReviewItems({ episodes, annotations, outputs, ideas });
+    return {
+      period: { mode: range.mode, from: range.from, to: range.to, timeZone: range.timeZone, days: range.dates.length },
+      coverage: {
+        observedDays: range.dates.length,
+        daysWithActivity: daily.filter((day) => day.intervals.length > 0).length,
+        intervalCount: new Set(daily.flatMap((day) => day.intervals.map((interval) => interval.intervalId))).size,
+        activeDurationMs: daily.reduce((sum, day) => sum + day.metrics.activeDurationMs, 0),
+        lastObservedEventAt: latestEventAt,
+        historicalVisits: this.getHistoricalStats().visits,
+      },
+      summary: current,
+      previousSummary: previous,
+      reviewItems,
+      recentIdeas: ideas.slice(-8).reverse(),
+      recentOutputs: outputs.slice(-8).reverse(),
+      resumeCandidates: episodes.filter((episode) => episode.ideaCount > 0 && episode.outputCount === 0).slice(-8).reverse().map((episode) => ({
+        episodeId: episode.episodeId,
+        date: episode.startedAt.slice(0, 10),
+        topicLabel: episode.topicLabel,
+        activeDurationMs: episode.activeDurationMs,
+        reason: "Contains an explicit idea and no linked output.",
+      })),
+    };
+  }
+
   getHistoricalSummary(timeZone = "UTC"): Record<string, unknown> {
     try { new Intl.DateTimeFormat("en", { timeZone }).format(0); }
     catch { throw new Error("Invalid IANA time zone"); }
@@ -1136,6 +1182,16 @@ function parseStringArray(value: unknown): string[] {
   } catch {
     return [];
   }
+}
+
+function uniqueById<T>(values: T[], id: (value: T) => string): T[] {
+  const seen = new Set<string>();
+  return values.filter((value) => {
+    const key = id(value);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function nullableString(value: unknown): string | null {

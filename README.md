@@ -13,7 +13,7 @@ The governing principle is simple: **browser activity is evidence about context,
 - Buffers events locally through collector outages with bounded storage, batching, retry, duplicate-safe IDs, and visible dropped-event counts.
 - Derives active foreground intervals, focus periods, tab/domain switches, and explainable research episodes from immutable events.
 - Collects commit metadata through a generic output-connector interface with an initial local Git connector, then associates outputs to the nearest episode inside a configurable evidence window.
-- Hosts an authenticated local daily/weekly/monthly dashboard with raw-evidence drill-down, linked outputs, episode annotations, privacy controls, profile import, export, and deletion.
+- Hosts an authenticated local Overview, Explore, daily/weekly/monthly dashboard with raw-evidence drill-down, review inbox, linked outputs, episode annotations, privacy controls, profile import, export, and deletion.
 - Projects UTC evidence into the dashboard's IANA time zone, clips intervals at local-day edges, and handles 23/25-hour daylight-saving days without double counting.
 - Previews and exports range-limited, token-budgeted LLM analysis packs as Markdown or JSONL with aggregate, contextual, and detailed privacy profiles.
 
