@@ -278,7 +278,14 @@ async function handleRequest(
     return;
   }
   if (request.method === "GET" && url.pathname === "/api/history/summary") {
-    try { json(response, 200, store.getHistoricalSummary(url.searchParams.get("timezone") ?? "UTC")); }
+    const browser = url.searchParams.get("browser") || undefined;
+    const profileId = url.searchParams.get("profileId") || undefined;
+    if (browser && browser !== "chrome" && browser !== "brave") {
+      json(response, 400, { error: "invalid_history_filter", message: "browser must be chrome or brave" });
+      return;
+    }
+    const historyOptions = { privacy: privacySettings, ...(browser ? { browser } : {}), ...(profileId ? { profileId } : {}) };
+    try { json(response, 200, store.getHistoricalSummary(url.searchParams.get("timezone") ?? "UTC", historyOptions)); }
     catch (error) { json(response, 400, { error: "invalid_timezone", message: error instanceof Error ? error.message : "Invalid time zone" }); }
     return;
   }

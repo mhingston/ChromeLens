@@ -18,7 +18,7 @@ import type {
 } from "../../domain/src/index.ts";
 import { EPISODE_ANNOTATION_LABELS } from "../../domain/src/index.ts";
 import { associateOutputsToEpisodes, type OutputAssociationOptions } from "../../connectors/src/index.ts";
-import { sanitizeActivityEvent, type PrivacySettings } from "../../privacy/src/index.ts";
+import { isExcludedUrl, sanitizeActivityEvent, sanitizeUrlForDisplay, type PrivacySettings } from "../../privacy/src/index.ts";
 import { countDomainTransitions, countTabTransitions, countUniqueContextBoundaries, deriveActiveIntervals, deriveFocusPeriods, groupResearchEpisodes } from "../../sessionisation/src/index.ts";
 import {
   addCalendarDays,
@@ -147,6 +147,12 @@ export interface HistoryImportBatch {
     startedAt: string;
     completedAt: string;
   };
+}
+
+export interface HistoricalSummaryOptions {
+  browser?: string;
+  profileId?: string;
+  privacy?: PrivacySettings;
 }
 
 export class ActivityStore {
@@ -723,71 +729,107 @@ export class ActivityStore {
     };
   }
 
-  getHistoricalSummary(timeZone = "UTC"): Record<string, unknown> {
+  getHistoricalSummary(timeZone = "UTC", options: HistoricalSummaryOptions = {}): Record<string, unknown> {
     try { new Intl.DateTimeFormat("en", { timeZone }).format(0); }
     catch { throw new Error("Invalid IANA time zone"); }
+    const allUrlRows = this.database.prepare("SELECT * FROM historical_urls ORDER BY last_visit_at").all() as Array<Record<string, unknown>>;
+    const visibleUrlRows = allUrlRows.filter((row) => !options.privacy || !isExcludedUrl(String(row.url), options.privacy));
+    const selectedUrlRows = visibleUrlRows.filter((row) => matchesHistoryProfile(row, options));
+    const visibleUrlKeys = new Set(visibleUrlRows.map(historyRowKey));
+    const selectedUrlKeys = new Set(selectedUrlRows.map(historyRowKey));
+    const allVisitRows = this.database.prepare("SELECT * FROM historical_visits ORDER BY visited_at").all() as Array<Record<string, unknown>>;
+    const visibleVisitRows = allVisitRows.filter((row) => visibleUrlKeys.has(historyRowKey(row)));
+    const selectedVisitRows = visibleVisitRows.filter((row) => selectedUrlKeys.has(historyRowKey(row)) && matchesHistoryProfile(row, options));
+    const displayUrl = (row: Record<string, unknown>): string | null => options.privacy
+      ? sanitizeUrlForDisplay(String(row.url), options.privacy)
+      : String(row.url);
+    const displayUrlByKey = new Map(selectedUrlRows.map((row) => [historyRowKey(row), displayUrl(row)] as const));
+    const visitTimesByUrl = new Map<string, string[]>();
+    for (const row of selectedVisitRows) {
+      const key = historyRowKey(row);
+      const values = visitTimesByUrl.get(key) ?? [];
+      values.push(String(row.visited_at));
+      visitTimesByUrl.set(key, values);
+    }
     // History timestamps are stored as UTC instants. Project each visit into the requested
     // IANA zone before grouping; grouping the raw ISO hour would mislabel local patterns.
-    const historicalVisits = this.database.prepare("SELECT visited_at FROM historical_visits ORDER BY visited_at").all() as Array<Record<string, unknown>>;
     const hourCounts = Array.from({ length: 24 }, () => 0);
-    for (const row of historicalVisits) {
+    for (const row of selectedVisitRows) {
       const local = formatLocalDateTime(String(row.visited_at), timeZone);
       hourCounts[Number(local.slice(11, 13))]! += 1;
     }
-    const topDomainRows = this.database.prepare(`
-      SELECT u.domain, SUM(COALESCE(u.visit_count, 0)) AS visits, COUNT(*) AS pages,
-        MIN(v.visited_at) AS first_visit_at, MAX(v.visited_at) AS latest_visit_at
-      FROM historical_urls u LEFT JOIN historical_visits v
-        ON v.source_browser = u.source_browser AND v.source_profile_id = u.source_profile_id AND v.source_url_id = u.source_url_id
-      WHERE u.domain IS NOT NULL GROUP BY u.domain ORDER BY visits DESC LIMIT 20
-    `).all() as Array<Record<string, unknown>>;
-    const topDomains = topDomainRows.map((row) => ({
-      domain: nullableString(row.domain), visits: Number(row.visits), pages: Number(row.pages),
-      firstVisitAt: nullableString(row.first_visit_at), latestVisitAt: nullableString(row.latest_visit_at),
-    }));
-    const revisitedPageRows = this.database.prepare(`
-      SELECT u.url, u.title, u.domain, u.visit_count, u.typed_count, u.last_visit_at,
-        u.source_browser, u.source_profile_id, MIN(v.visited_at) AS first_visit_at
-      FROM historical_urls u LEFT JOIN historical_visits v
-        ON v.source_browser = u.source_browser AND v.source_profile_id = u.source_profile_id AND v.source_url_id = u.source_url_id
-      GROUP BY u.source_browser, u.source_profile_id, u.source_url_id
-      ORDER BY u.visit_count DESC LIMIT 20
-    `).all() as Array<Record<string, unknown>>;
-    const revisitedPages = revisitedPageRows.map((row) => ({
-      url: String(row.url), title: nullableString(row.title), domain: nullableString(row.domain),
-      visitCount: row.visit_count === null || row.visit_count === undefined ? null : Number(row.visit_count),
-      typedCount: row.typed_count === null || row.typed_count === undefined ? null : Number(row.typed_count),
-      lastVisitAt: nullableString(row.last_visit_at), firstVisitAt: nullableString(row.first_visit_at),
-      browser: String(row.source_browser), profileId: String(row.source_profile_id),
-    }));
-    const searchTermRows = this.database.prepare(`
-      SELECT term, source_browser, source_profile_id, COUNT(*) AS occurrences
-      FROM historical_search_terms GROUP BY term, source_browser, source_profile_id ORDER BY occurrences DESC, term LIMIT 50
-    `).all() as Array<Record<string, unknown>>;
-    const searchTerms = searchTermRows.map((row) => ({
-      term: String(row.term), browser: String(row.source_browser), profileId: String(row.source_profile_id), occurrences: Number(row.occurrences),
-    }));
-    const profileRows = this.database.prepare(`
-      SELECT source_browser, source_profile_id, COUNT(*) AS visits, MIN(visited_at) AS first_visit_at, MAX(visited_at) AS latest_visit_at
-      FROM historical_visits GROUP BY source_browser, source_profile_id ORDER BY source_browser, source_profile_id
-    `).all() as Array<Record<string, unknown>>;
-    const profiles = profileRows.map((row) => ({
-      browser: String(row.source_browser), profileId: String(row.source_profile_id), visits: Number(row.visits),
-      firstVisitAt: nullableString(row.first_visit_at), latestVisitAt: nullableString(row.latest_visit_at),
-    }));
-    const importRuns = this.database.prepare(`
-      SELECT import_id, source_browser, source_profile_id, source_schema_version, importer_version,
-        fields_imported_json, started_at, completed_at, urls_seen, visits_seen, urls_inserted, visits_inserted
-      FROM import_runs ORDER BY completed_at DESC
-    `).all() as Array<Record<string, unknown>>;
+    const domainTotals = new Map<string, { visits: number; pages: number; firstVisitAt: string | null; latestVisitAt: string | null }>();
+    for (const row of selectedUrlRows) {
+      const domain = nullableString(row.domain);
+      if (!domain) continue;
+      const times = visitTimesByUrl.get(historyRowKey(row)) ?? [];
+      const existing = domainTotals.get(domain) ?? { visits: 0, pages: 0, firstVisitAt: null, latestVisitAt: null };
+      existing.visits += row.visit_count === null || row.visit_count === undefined ? times.length : Number(row.visit_count);
+      existing.pages += 1;
+      existing.firstVisitAt = minIso(existing.firstVisitAt, times[0] ?? null);
+      existing.latestVisitAt = maxIso(existing.latestVisitAt, times.at(-1) ?? null);
+      domainTotals.set(domain, existing);
+    }
+    const topDomains = [...domainTotals.entries()]
+      .map(([domain, values]) => ({ domain, ...values }))
+      .sort((left, right) => right.visits - left.visits || left.domain.localeCompare(right.domain))
+      .slice(0, 20);
+    const revisitedPages = selectedUrlRows
+      .filter((row) => row.visit_count !== null && Number(row.visit_count) > 1)
+      .map((row) => {
+        const times = visitTimesByUrl.get(historyRowKey(row)) ?? [];
+        return {
+          url: displayUrlByKey.get(historyRowKey(row)), title: nullableString(row.title), domain: nullableString(row.domain),
+          visitCount: row.visit_count === null || row.visit_count === undefined ? null : Number(row.visit_count),
+          typedCount: row.typed_count === null || row.typed_count === undefined ? null : Number(row.typed_count),
+          lastVisitAt: nullableString(row.last_visit_at), firstVisitAt: times[0] ?? null,
+          browser: String(row.source_browser), profileId: String(row.source_profile_id),
+        };
+      })
+      .sort((left, right) => (right.visitCount ?? 0) - (left.visitCount ?? 0) || (left.url ?? "").localeCompare(right.url ?? ""))
+      .slice(0, 20);
+    const searchTermRows = this.database.prepare("SELECT term, source_browser, source_profile_id, source_url_id FROM historical_search_terms ORDER BY term").all() as Array<Record<string, unknown>>;
+    const selectedSearchTerms = searchTermRows.filter((row) => {
+      const key = `${String(row.source_browser)}\0${String(row.source_profile_id)}\0${String(row.source_url_id)}`;
+      return visibleUrlKeys.has(key) && selectedUrlKeys.has(key);
+    });
+    const searchTermCounts = new Map<string, { term: string; browser: string; profileId: string; occurrences: number }>();
+    for (const row of selectedSearchTerms) {
+      const key = `${String(row.source_browser)}\0${String(row.source_profile_id)}\0${String(row.term)}`;
+      const existing = searchTermCounts.get(key) ?? { term: String(row.term), browser: String(row.source_browser), profileId: String(row.source_profile_id), occurrences: 0 };
+      existing.occurrences += 1;
+      searchTermCounts.set(key, existing);
+    }
+    const searchTerms = [...searchTermCounts.values()]
+      .sort((left, right) => right.occurrences - left.occurrences || left.term.localeCompare(right.term))
+      .slice(0, 50);
+    const profileCounts = new Map<string, { browser: string; profileId: string; visits: number; firstVisitAt: string | null; latestVisitAt: string | null }>();
+    for (const row of visibleVisitRows) {
+      const key = `${String(row.source_browser)}\0${String(row.source_profile_id)}`;
+      const existing = profileCounts.get(key) ?? { browser: String(row.source_browser), profileId: String(row.source_profile_id), visits: 0, firstVisitAt: null, latestVisitAt: null };
+      existing.visits += 1;
+      existing.firstVisitAt = minIso(existing.firstVisitAt, String(row.visited_at));
+      existing.latestVisitAt = maxIso(existing.latestVisitAt, String(row.visited_at));
+      profileCounts.set(key, existing);
+    }
+    const profileOptions = [...profileCounts.values()].sort((left, right) => left.browser.localeCompare(right.browser) || left.profileId.localeCompare(right.profileId));
+    const profiles = profileOptions.filter((profile) => (!options.browser || profile.browser === options.browser) && (!options.profileId || profile.profileId === options.profileId));
+    const importRuns = (this.database.prepare("SELECT import_id, source_browser, source_profile_id, source_schema_version, importer_version, fields_imported_json, started_at, completed_at, urls_seen, visits_seen, urls_inserted, visits_inserted FROM import_runs ORDER BY completed_at DESC").all() as Array<Record<string, unknown>>)
+      .filter((row) => (!options.browser || row.source_browser === options.browser) && (!options.profileId || row.source_profile_id === options.profileId));
+    const selectedStats = { urls: selectedUrlRows.length, visits: selectedVisitRows.length, searchTerms: selectedSearchTerms.length };
     return {
-      ...this.getHistoricalStats(),
+      ...selectedStats,
       timeZone,
+      browser: options.browser ?? null,
+      profileId: options.profileId ?? null,
       topDomains,
       revisitedPages,
       visitsByHour: hourCounts.map((visits, hour) => ({ hour, visits })),
-      searchTerms,
+      searchTerms: searchTerms.map((row) => ({
+        term: row.term, browser: row.browser, profileId: row.profileId, occurrences: row.occurrences,
+      })),
       profiles,
+      profileOptions,
       importRuns: importRuns.map((row) => ({
         importId: String(row.import_id), browser: String(row.source_browser), profileId: String(row.source_profile_id),
         schemaVersion: row.source_schema_version === null || row.source_schema_version === undefined ? null : Number(row.source_schema_version),
@@ -795,7 +837,7 @@ export class ActivityStore {
         startedAt: String(row.started_at), completedAt: String(row.completed_at), urlsSeen: Number(row.urls_seen), visitsSeen: Number(row.visits_seen),
         urlsInserted: Number(row.urls_inserted), visitsInserted: Number(row.visits_inserted),
       })),
-      caveat: "Historical counts and browser-recorded elapsed duration cannot reconstruct foreground attention.",
+      caveat: "Historical visits are browser-recorded evidence only. They are not prospective active intervals, focused attention, or productivity measures.",
     };
   }
 
@@ -1192,6 +1234,27 @@ function uniqueById<T>(values: T[], id: (value: T) => string): T[] {
     seen.add(key);
     return true;
   });
+}
+
+function historyRowKey(row: Record<string, unknown>): string {
+  return `${String(row.source_browser)}\0${String(row.source_profile_id)}\0${String(row.source_url_id)}`;
+}
+
+function matchesHistoryProfile(row: Record<string, unknown>, options: HistoricalSummaryOptions): boolean {
+  return (!options.browser || String(row.source_browser) === options.browser)
+    && (!options.profileId || String(row.source_profile_id) === options.profileId);
+}
+
+function minIso(current: string | null, candidate: string | null): string | null {
+  if (!current) return candidate;
+  if (!candidate) return current;
+  return candidate < current ? candidate : current;
+}
+
+function maxIso(current: string | null, candidate: string | null): string | null {
+  if (!current) return candidate;
+  if (!candidate) return current;
+  return candidate > current ? candidate : current;
 }
 
 function nullableString(value: unknown): string | null {

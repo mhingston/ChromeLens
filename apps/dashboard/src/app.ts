@@ -15,6 +15,8 @@ const evidenceDrawerContent = document.querySelector<HTMLElement>("#evidence-dra
 const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 let token = localStorage.getItem("chromelens-token") ?? "";
 let view = "overview";
+let historyBrowser = "";
+let historyProfile = "";
 let pendingEvidenceTarget: { intervalId?: string; episodeId?: string; outputId?: string; ideaId?: string } | null = null;
 dateInput.value = localCalendarDate(new Date());
 rangeModeInput.value = "calendar_week";
@@ -43,12 +45,12 @@ document.querySelector<HTMLFormElement>("#token-form")!.addEventListener("submit
 async function load(): Promise<void> {
   const titles: Record<string, [string,string]> = {
     overview:["OVERVIEW","What needs attention, and where to resume."], day:["EXPLORE / DAY","A day in context."], week:["PATTERNS / WEEK","Seven days, observed."],
-    month:["MONTHLY PATTERNS","A calendar month, observed."], settings:["LOCAL CONTROLS","Privacy & data."],
+    month:["MONTHLY PATTERNS","A calendar month, observed."], history:["HISTORY / IMPORTED","Browser-recorded evidence, separately labelled."], settings:["LOCAL CONTROLS","Privacy & data."],
   };
   document.querySelector("#view-kicker")!.textContent = titles[view]![0];
   document.querySelector("#view-title")!.textContent = titles[view]![1];
-  document.querySelector<HTMLElement>("#date-controls")!.hidden = view === "settings";
-  rangeModeInput.hidden = view === "day" || view === "settings";
+  document.querySelector<HTMLElement>("#date-controls")!.hidden = view === "settings" || view === "history";
+  rangeModeInput.hidden = view === "day" || view === "settings" || view === "history";
   syncRangeControls();
   content.replaceChildren(el("div", "loading", "Focusing the lens…"));
   notice.hidden = true;
@@ -58,6 +60,7 @@ async function load(): Promise<void> {
     if (view === "overview") renderOverview(await api(overviewQuery()));
     else if (view === "day") renderDay(await api(`/api/summary/daily?date=${dateInput.value}&timezone=${encodeURIComponent(timeZone)}`));
     else if (view === "week" || view === "month") renderRange(await api(rangeQuery()));
+    else if (view === "history") renderHistory(await api(historyQuery()));
     else await renderSettings();
   } catch (error) {
     if (error instanceof CollectorApiError && error.status === 401) return requireToken();
@@ -94,8 +97,15 @@ function overviewQuery(): string {
   return `/api/overview?from=${range.from}&to=${range.to}&days=${range.dates.length}&mode=${mode}&timezone=${encodeURIComponent(timeZone)}`;
 }
 
+function historyQuery(): string {
+  const query = new URLSearchParams({ timezone: timeZone });
+  if (historyBrowser) query.set("browser", historyBrowser);
+  if (historyProfile) query.set("profileId", historyProfile);
+  return `/api/history/summary?${query.toString()}`;
+}
+
 function syncRangeControls(): void {
-  customRange.hidden = view === "day" || view === "settings" || rangeModeInput.value !== "custom";
+  customRange.hidden = view === "day" || view === "settings" || view === "history" || rangeModeInput.value !== "custom";
 }
 
 function renderOverview(data: Json): void {
@@ -112,6 +122,139 @@ function renderOverview(data: Json): void {
   grid.append(reviewInboxCard(data.reviewItems), comparisonCard(summary, data.previousSummary, data.period), resumeCard(data.resumeCandidates), recentIdeasCard(data.recentIdeas), recentOutputsCard(data.recentOutputs));
   content.replaceChildren(metrics, grid);
   if (!data.reviewItems.length) showNotice("No review items were derived for this range.");
+}
+
+function renderHistory(data: Json): void {
+  const metrics = el("section", "metric-grid");
+  metrics.append(
+    metric("Historical visits", String(data.visits), "Browser-recorded visit facts"),
+    metric("Historical URLs", String(data.urls), "Imported URL records"),
+    metric("Search terms", String(data.searchTerms), "Terms retained by the import"),
+    metric("Profiles in scope", String(data.profiles.length), `${data.timeZone} local-time projection`),
+  );
+  const grid = el("section", "grid");
+  grid.append(
+    historyFiltersCard(data),
+    historyCaveatCard(data),
+    historyDomainsCard(data),
+    historyPagesCard(data),
+    historyTimeCard(data),
+    historySearchTermsCard(data),
+    historyProfilesCard(data),
+    historyImportsCard(data),
+  );
+  content.replaceChildren(metrics, grid);
+}
+
+function historyFiltersCard(data: Json): HTMLElement {
+  const card = cardShell("History scope", "Filter imported browser evidence independently from prospective activity.", "wide");
+  const fields = el("div", "history-filters");
+  const browserNames: string[] = Array.from(new Set<string>(data.profileOptions.map((profile: Json) => String(profile.browser))));
+  const browsers: string[][] = [["", "All browsers"], ...browserNames.map((browser: string) => [browser, labelText(browser)])];
+  const browser = selectField("Browser", browsers, historyBrowser);
+  const profiles: string[][] = [["", "All profiles"], ...data.profileOptions.map((profile: Json) => [profile.profileId, `${profile.browser} · ${profile.profileId}`])];
+  const profile = selectField("Profile", profiles, historyProfile);
+  browser.input.addEventListener("change", () => { historyBrowser = browser.input.value; historyProfile = ""; void load(); });
+  profile.input.addEventListener("change", () => { historyProfile = profile.input.value; void load(); });
+  fields.append(browser.wrapper, profile.wrapper);
+  card.append(fields, el("p", "history-filter-note", `Local time zone: ${data.timeZone}. Imported history is never added to active foreground totals.`));
+  return card;
+}
+
+function historyCaveatCard(data: Json): HTMLElement {
+  const card = cardShell("Historical evidence boundary", data.caveat, "wide history-caveat");
+  card.append(el("p", "history-filter-note", "Visits may reflect open tabs, redirects, sync, deleted records, or browser bookkeeping. Browser-recorded elapsed duration is not shown as active time."));
+  return card;
+}
+
+function historyDomainsCard(data: Json): HTMLElement {
+  const card = cardShell("Top historical domains", "Ranked by imported browser visit counts; this is not foreground attention.");
+  const list = scrollRegion(el("div", "bar-list"), "Top historical domains");
+  if (!data.topDomains.length) list.append(empty("No historical domains are visible in this scope."));
+  const maximum = data.topDomains[0]?.visits || 1;
+  data.topDomains.forEach((item: Json) => {
+    const note = `${item.pages} imported page record(s) · ${historicalInstant(item.firstVisitAt)} to ${historicalInstant(item.latestVisitAt)}`;
+    list.append(barRow(item.domain || "Unknown domain", `${item.visits} visits`, item.visits / maximum, note));
+  });
+  card.append(list);
+  return card;
+}
+
+function historyPagesCard(data: Json): HTMLElement {
+  const card = cardShell("Frequently revisited pages", "URL, title, typed count, and provenance follow the active privacy projection.", "wide");
+  const list = scrollRegion(el("div", "history-page-list"), "Frequently revisited historical pages", "tall");
+  if (!data.revisitedPages.length) list.append(empty("No repeated historical pages are visible in this scope."));
+  data.revisitedPages.forEach((page: Json) => {
+    const row = el("article", "history-page");
+    row.append(
+      el("strong", "", page.title || page.domain || "Untitled historical page"),
+      el("p", "history-url", page.url || "URL not retained by privacy configuration"),
+      el("small", "", `${page.visitCount ?? "Unknown"} visits${page.typedCount === null ? "" : ` · ${page.typedCount} typed`} · ${page.browser} · ${page.profileId}`),
+      el("small", "", `${historicalInstant(page.firstVisitAt)} first · ${historicalInstant(page.lastVisitAt)} latest`),
+    );
+    list.append(row);
+  });
+  card.append(list);
+  return card;
+}
+
+function historyTimeCard(data: Json): HTMLElement {
+  const card = cardShell("Historical visits by local time", `Visits projected into ${data.timeZone}; values are counts of imported records, not attention duration.`, "wide");
+  const chart = el("div", "history-hour-chart");
+  const summary = el("div", "chart-summary");
+  const maximum = Math.max(1, ...data.visitsByHour.map((item: Json) => item.visits));
+  data.visitsByHour.forEach((item: Json) => {
+    const column = el("div", "history-hour-column");
+    const fill = el("i", "");
+    fill.style.height = `${Math.max(item.visits ? 4 : 1, (item.visits / maximum) * 100)}%`;
+    fill.setAttribute("role", "img");
+    fill.setAttribute("aria-label", `${String(item.hour).padStart(2, "0")}:00 · ${item.visits} historical visits`);
+    column.append(fill, el("span", "", String(item.hour).padStart(2, "0")));
+    chart.append(column);
+    if (item.visits) summary.append(el("span", "", `${String(item.hour).padStart(2, "0")}:00 · ${item.visits}`));
+  });
+  if (!summary.childElementCount) summary.append(el("span", "", "No historical visits in this scope."));
+  card.append(chart, summary);
+  return card;
+}
+
+function historySearchTermsCard(data: Json): HTMLElement {
+  const card = cardShell("Historical search terms", "Only terms attached to retained, in-scope imported URLs are shown.");
+  const list = scrollRegion(el("div", "history-term-list"), "Historical search terms");
+  if (!data.searchTerms.length) list.append(empty("No historical search terms are available or visible."));
+  data.searchTerms.forEach((term: Json) => {
+    const row = el("div", "history-term");
+    row.append(el("strong", "", term.term), el("span", "", `${term.occurrences} occurrence(s) · ${term.browser} · ${term.profileId}`));
+    list.append(row);
+  });
+  card.append(list);
+  return card;
+}
+
+function historyProfilesCard(data: Json): HTMLElement {
+  const card = cardShell("Browser and profile provenance", "History remains attributable to the browser profile that supplied it.");
+  const list = scrollRegion(el("div", "history-profile-list"), "Historical profile provenance");
+  if (!data.profiles.length) list.append(empty("No historical profiles are visible in this scope."));
+  data.profiles.forEach((profile: Json) => {
+    const row = el("article", "history-profile");
+    row.append(el("strong", "", `${profile.browser} · ${profile.profileId}`), el("span", "", `${profile.visits} visits`), el("small", "", `${historicalInstant(profile.firstVisitAt)} first · ${historicalInstant(profile.latestVisitAt)} latest`));
+    list.append(row);
+  });
+  card.append(list);
+  return card;
+}
+
+function historyImportsCard(data: Json): HTMLElement {
+  const card = cardShell("Import provenance", "Local import runs and supported fields are shown without exposing source file paths.", "wide");
+  const list = scrollRegion(el("div", "history-import-list"), "History import provenance");
+  if (!data.importRuns.length) list.append(empty("No browser history import has been recorded."));
+  data.importRuns.forEach((run: Json) => {
+    const row = el("article", "history-import");
+    row.append(el("strong", "", `${run.browser} · ${run.profileId}`), el("span", "", `${run.urlsInserted} URL record(s) · ${run.visitsInserted} visit record(s)`), el("small", "", `Importer ${run.importerVersion} · schema ${run.schemaVersion ?? "unknown"} · completed ${historicalInstant(run.completedAt)}`));
+    list.append(row);
+  });
+  card.append(list);
+  return card;
 }
 
 function reviewInboxCard(items: Json[]): HTMLElement {
@@ -699,6 +842,7 @@ function el<K extends keyof HTMLElementTagNameMap>(tag:K,className="",text=""):H
 function scrollRegion<T extends HTMLElement>(node:T,label:string,size:"standard"|"tall"="standard"):T{node.classList.add("scroll-region");if(size==="tall")node.classList.add("scroll-region-tall");node.tabIndex=0;node.setAttribute("role","region");node.setAttribute("aria-label",label);return node}
 function cardShell(title:string,subtitle:string,extra=""):HTMLElement{const card=el("section",`card ${extra}`.trim());card.append(el("h2","",title),el("p","card-subtitle",subtitle));return card} function metric(label:string,value:string,note:string):HTMLElement{const node=el("article","metric");node.append(el("p","",label),el("strong","",value),el("small","",note));return node} function barRow(label:string,value:string,ratio:number,note=""):HTMLElement{const row=el("div","bar-row");row.append(el("span","",label),el("strong","",value));if(note)row.append(el("small","bar-row-note",note));const bar=el("div","bar");const fill=el("i","");fill.style.width=`${Math.max(1,Math.min(100,ratio*100))}%`;bar.append(fill);row.append(bar);return row}
 function duration(ms:number):string{return formatDuration(ms)} function clock(iso:string):string{return new Intl.DateTimeFormat("en-GB",{timeZone,hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).format(new Date(iso))} function number(value:number):string{return Number(value||0).toFixed(1)} function median(values:number[]):number{if(!values.length)return 0;const sorted=[...values].sort((a,b)=>a-b),mid=Math.floor(sorted.length/2);return sorted.length%2?sorted[mid]!:(sorted[mid-1]!+sorted[mid]!)/2}
+function historicalInstant(iso:string|null|undefined):string{return iso?`${localCalendarDate(new Date(iso))} ${clock(iso)}`:"Unknown time"}
 function localCalendarDate(value:Date):string{const parts=new Intl.DateTimeFormat("en-GB",{timeZone,year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(value);const part=(type:string)=>parts.find((item)=>item.type===type)!.value;return `${part("year")}-${part("month")}-${part("day")}`}
 function shiftCalendarDate(date:string,days:number):string{const [year,month,day]=date.split("-").map(Number) as [number,number,number];return new Date(Date.UTC(year,month-1,day+days)).toISOString().slice(0,10)}
 function shiftCalendarMonth(date:string,months:number):string{const [year,month,day]=date.split("-").map(Number) as [number,number,number];const target=new Date(Date.UTC(year,month-1+months,1));const lastDay=new Date(Date.UTC(target.getUTCFullYear(),target.getUTCMonth()+1,0)).getUTCDate();return `${target.getUTCFullYear()}-${String(target.getUTCMonth()+1).padStart(2,"0")}-${String(Math.min(day,lastDay)).padStart(2,"0")}`}

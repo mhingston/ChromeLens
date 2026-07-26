@@ -48,6 +48,8 @@ Range summaries accept explicit calendar-week, calendar-month, rolling-7, rollin
 
 The authenticated `/api/overview` route combines a selected range summary with an equal-length preceding-period comparison, evidence coverage, deterministic review items, recent ideas and outputs, and resume candidates. Review navigation returns to the day evidence surface; it does not turn associations or missing records into productivity judgements.
 
+The authenticated `/api/history/summary` route projects imported browser history into the requested IANA timezone, applies the canonical privacy projection before returning URLs or search terms, and accepts independent browser/profile filters. Its response includes historical-only counts, revisited pages, profile provenance, and import-run metadata; it never labels browser-recorded elapsed duration as active time.
+
 Complexity is kept behind these interfaces. SQLite, the filesystem, Chrome APIs, HTTP, time, and Git are adapters at real seams; domain tests exercise public behavior rather than private helpers.
 
 Accepted event batches recompute active intervals only for affected browser sessions, then regroup episodes from stored intervals. Human annotations store interval/time anchors and are re-associated across derivation identity changes. Rename, split-before, and merge-before corrections are separate user-authored facts anchored to stable interval IDs and applied by sessionisation during every regrouping. Schema migrations add durable fields to existing local databases without discarding records.

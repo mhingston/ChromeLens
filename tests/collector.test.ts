@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ActivityEvent } from "../packages/domain/src/index.ts";
 import { ActivityStore } from "../packages/database/src/index.ts";
 import { createCollectorServer, type CollectorServer } from "../apps/collector/src/server.ts";
+import { defaultPrivacySettings } from "../packages/privacy/src/index.ts";
 
 const running: CollectorServer[] = [];
 const run = promisify(execFile);
@@ -15,6 +16,52 @@ afterEach(async () => {
 });
 
 describe("loopback collector", () => {
+  it("serves privacy-filtered historical evidence with profile filters and local-time counts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "chromelens-history-api-"));
+    const store = new ActivityStore(join(root, "collector.sqlite"));
+    store.importHistoryBatch({
+      urls: [
+        { sourceBrowser: "chrome", sourceProfileId: "chrome:Default", sourceUrlId: 1, url: "https://example.com/research?token=raw-secret", canonicalUrl: "https://example.com/research?token=raw-secret", domain: "example.com", title: "Research page", visitCount: 2, typedCount: 1, lastVisitAt: "2026-07-19T00:30:00.000Z", importedAt: "2026-07-19T01:00:00.000Z" },
+        { sourceBrowser: "chrome", sourceProfileId: "chrome:Profile 2", sourceUrlId: 2, url: "https://other.example/notes", canonicalUrl: "https://other.example/notes", domain: "other.example", title: "Notes", visitCount: 1, typedCount: 0, lastVisitAt: "2026-07-19T02:30:00.000Z", importedAt: "2026-07-19T03:00:00.000Z" },
+        { sourceBrowser: "chrome", sourceProfileId: "chrome:Default", sourceUrlId: 3, url: "https://secret.example/account", canonicalUrl: "https://secret.example/account", domain: "secret.example", title: "Private account", visitCount: 4, typedCount: 2, lastVisitAt: "2026-07-19T03:30:00.000Z", importedAt: "2026-07-19T04:00:00.000Z" },
+      ],
+      visits: [
+        { sourceBrowser: "chrome", sourceProfileId: "chrome:Default", sourceVisitId: 1, sourceUrlId: 1, visitedAt: "2026-07-18T23:30:00.000Z", browserElapsedDurationMs: 1000, transitionType: "typed", transitionRaw: null, referringVisitId: null, openerVisitId: null, visitSource: "local", importedAt: "2026-07-19T01:00:00.000Z" },
+        { sourceBrowser: "chrome", sourceProfileId: "chrome:Default", sourceVisitId: 2, sourceUrlId: 1, visitedAt: "2026-07-19T00:30:00.000Z", browserElapsedDurationMs: 1000, transitionType: "link", transitionRaw: null, referringVisitId: null, openerVisitId: null, visitSource: "local", importedAt: "2026-07-19T01:00:00.000Z" },
+        { sourceBrowser: "chrome", sourceProfileId: "chrome:Profile 2", sourceVisitId: 3, sourceUrlId: 2, visitedAt: "2026-07-19T02:30:00.000Z", browserElapsedDurationMs: null, transitionType: "link", transitionRaw: null, referringVisitId: null, openerVisitId: null, visitSource: "local", importedAt: "2026-07-19T03:00:00.000Z" },
+        { sourceBrowser: "chrome", sourceProfileId: "chrome:Default", sourceVisitId: 4, sourceUrlId: 3, visitedAt: "2026-07-19T03:30:00.000Z", browserElapsedDurationMs: null, transitionType: "typed", transitionRaw: null, referringVisitId: null, openerVisitId: null, visitSource: "local", importedAt: "2026-07-19T04:00:00.000Z" },
+      ],
+      searchTerms: [
+        { sourceBrowser: "chrome", sourceProfileId: "chrome:Default", sourceUrlId: 1, term: "visible research", importedAt: "2026-07-19T01:00:00.000Z" },
+        { sourceBrowser: "chrome", sourceProfileId: "chrome:Default", sourceUrlId: 3, term: "private query", importedAt: "2026-07-19T04:00:00.000Z" },
+      ],
+      run: { importId: "history-run", sourceBrowser: "chrome", sourceProfileId: "chrome:Default", sourcePath: "/not-returned", sourceSchemaVersion: 70, importerVersion: "test", fieldsImportedJson: "{\"searchTerms\":true}", startedAt: "2026-07-19T00:00:00.000Z", completedAt: "2026-07-19T04:00:00.000Z" },
+    });
+    const privacy = { ...defaultPrivacySettings, excludedDomains: [...defaultPrivacySettings.excludedDomains, "secret.example"] };
+    const server = createCollectorServer({ store, token: "test-secret", host: "127.0.0.1", port: 0, privacySettings: privacy });
+    running.push(server);
+    const address = await server.start();
+    const headers = { authorization: "Bearer test-secret" };
+    const all = await fetch(`${address}/api/history/summary?timezone=Europe%2FLondon`, { headers });
+    const filtered = await fetch(`${address}/api/history/summary?timezone=Europe%2FLondon&profileId=chrome%3AProfile%202`, { headers });
+    const invalid = await fetch(`${address}/api/history/summary?browser=safari`, { headers });
+    const body = await all.json() as Record<string, any>;
+    const filteredBody = await filtered.json() as Record<string, any>;
+
+    expect(all.status).toBe(200);
+    expect(body.visits).toBe(3);
+    expect(body.revisitedPages[0]).toMatchObject({ title: "Research page", typedCount: 1, browser: "chrome" });
+    expect(body.revisitedPages[0].url).toContain("%5BREDACTED%5D");
+    expect(body.searchTerms.map((term: Record<string, unknown>) => term.term)).toEqual(["visible research"]);
+    expect(body.visitsByHour.find((entry: Record<string, number>) => entry.hour === 0)?.visits).toBe(1);
+    expect(body.visitsByHour.find((entry: Record<string, number>) => entry.hour === 1)?.visits).toBe(1);
+    expect(body.importRuns[0]).toMatchObject({ importerVersion: "test", schemaVersion: 70 });
+    expect(filteredBody.visits).toBe(1);
+    expect(filteredBody.profiles[0]).toMatchObject({ profileId: "chrome:Profile 2" });
+    expect(invalid.status).toBe(400);
+    store.close();
+  });
+
   it("builds an authenticated overview with review items and a previous-period comparison", async () => {
     const root = await mkdtemp(join(tmpdir(), "chromelens-overview-"));
     const store = new ActivityStore(join(root, "collector.sqlite"));

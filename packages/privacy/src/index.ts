@@ -134,6 +134,25 @@ export function isExcludedDomain(domain: string, exclusions: string[]): boolean 
   });
 }
 
+/** Returns true when a URL is outside the configured retention surface. */
+export function isExcludedUrl(rawUrl: string, settings: PrivacySettings): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    return !isTrackableProtocol(parsed.protocol)
+      || isExcludedDomain(parsed.hostname, settings.excludedDomains)
+      || matchesAnyPattern(rawUrl, settings.excludedUrlPatterns);
+  } catch {
+    return true;
+  }
+}
+
+/** Applies the configured URL redaction rules to a retained historical URL. */
+export function sanitizeUrlForDisplay(rawUrl: string, settings: PrivacySettings): string | null {
+  if (isExcludedUrl(rawUrl, settings)) return null;
+  try { return sanitizeUrl(new URL(rawUrl), settings); }
+  catch { return null; }
+}
+
 function sanitizeUrl(parsed: URL, settings: PrivacySettings): string {
   parsed.hostname = parsed.hostname.toLowerCase();
   if (settings.removeFragments) parsed.hash = "";
