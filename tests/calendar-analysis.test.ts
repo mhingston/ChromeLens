@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ActiveInterval, ResearchEpisode } from "../packages/domain/src/index.ts";
 import {
+  calendarRange,
   calendarDayWindow,
   projectActivityWindow,
 } from "../packages/calendar-analysis/src/index.ts";
@@ -82,5 +83,13 @@ describe("calendar analysis", () => {
       endedAt: "2026-07-18T23:00:00.000Z",
       activeDurationMs: 2 * 60_000,
     });
+  });
+
+  it("generates explicit calendar and rolling ranges", () => {
+    expect(calendarRange("2026-07-15", "Europe/London", "calendar_week")).toMatchObject({
+      from: "2026-07-13", to: "2026-07-19", dates: expect.arrayContaining(["2026-07-13", "2026-07-19"]),
+    });
+    expect(calendarRange("2026-07-15", "Europe/London", "calendar_month")).toMatchObject({ from: "2026-07-01", to: "2026-07-31" });
+    expect(calendarRange("2026-07-15", "Europe/London", "rolling_7")).toMatchObject({ from: "2026-07-09", to: "2026-07-15" });
   });
 });

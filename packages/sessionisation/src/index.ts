@@ -210,6 +210,25 @@ export function deriveFocusPeriods(intervals: ActiveInterval[], toleranceMs = 60
   });
 }
 
+/** Count tab/domain transition boundaries once, even when one transition changes both. */
+export function countUniqueContextBoundaries(intervals: ActiveInterval[]): number {
+  const ordered = [...intervals].sort((left, right) => left.startedAt.localeCompare(right.startedAt));
+  return ordered.slice(1).filter((interval, index) => {
+    const previous = ordered[index]!;
+    return interval.tabId !== previous.tabId || interval.domain !== previous.domain;
+  }).length;
+}
+
+export function countTabTransitions(intervals: ActiveInterval[]): number {
+  const ordered = [...intervals].sort((left, right) => left.startedAt.localeCompare(right.startedAt));
+  return ordered.slice(1).filter((interval, index) => interval.tabId !== ordered[index]!.tabId).length;
+}
+
+export function countDomainTransitions(intervals: ActiveInterval[]): number {
+  const ordered = [...intervals].sort((left, right) => left.startedAt.localeCompare(right.startedAt));
+  return ordered.slice(1).filter((interval, index) => interval.domain !== ordered[index]!.domain).length;
+}
+
 export function groupResearchEpisodes(
   intervals: ActiveInterval[],
   ideas: CapturedIdea[] = [],

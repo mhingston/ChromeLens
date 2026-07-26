@@ -1,5 +1,5 @@
 import type { ActivityEvent, ActivityEventType, IdleState } from "../../../packages/domain/src/index.ts";
-import { sanitizeActivityEvent, withExcludedOrigin } from "../../../packages/privacy/src/index.ts";
+import { mergeRestrictivePrivacySettings, sanitizeActivityEvent, withExcludedOrigin } from "../../../packages/privacy/src/index.ts";
 import {
   enqueueForDelivery,
   markDeliveryFailed,
@@ -8,6 +8,7 @@ import {
   type DeliveryQueueState,
 } from "./delivery-queue.ts";
 import { getExtensionSettings, saveExtensionSettings, type ExtensionSettings } from "./settings.ts";
+import { fetchConnectionDiagnostic, statusLabel, type ConnectionStatus } from "./connection.ts";
 
 const QUEUE_KEY = "deliveryQueue";
 const MAX_QUEUE_SIZE = 5_000;
@@ -63,7 +64,7 @@ chrome.idle.onStateChanged.addListener((state) => {
   void emit(types[state], { idleState: state });
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "chromelens-delivery") void syncRemoteControl().then(() => flushQueue());
+  if (alarm.name === "chromelens-delivery") void syncRemoteControl().then(() => syncPrivacyConfig()).then(() => flushQueue());
 });
 chrome.runtime.onSuspend.addListener(() => {
   void emit("browser_session_ended", {});
@@ -85,6 +86,7 @@ async function initialise(): Promise<void> {
     await chrome.storage.session.set({ session: { ...session, startedRecorded: true } });
   }
   await captureCurrentContext("window_focused");
+  await syncPrivacyConfig();
   await flushQueue();
 }
 
@@ -159,6 +161,21 @@ async function flushQueue(): Promise<void> {
       return markDeliveryFailed(queue, Date.now(), error instanceof Error ? error.message : "Collector unavailable");
     }
   });
+  const stored = await chrome.storage.local.get(QUEUE_KEY) as { deliveryQueue?: DeliveryQueueState };
+  const queue = stored.deliveryQueue ?? newDeliveryQueue();
+  void reportDeliveryHealth(settings, queue);
+}
+
+async function reportDeliveryHealth(settings: ExtensionSettings, queue: DeliveryQueueState): Promise<void> {
+  try {
+    await fetch(`${settings.collectorUrl.replace(/\/$/, "")}/api/diagnostics/delivery`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", authorization: `Bearer ${settings.token}` },
+      body: JSON.stringify({ queuedEvents: queue.events.length, droppedEvents: queue.droppedCount, privacyConfigVersion: settings.privacyConfigVersion }),
+    });
+  } catch {
+    // Delivery health is advisory; local queueing must continue when the collector is offline.
+  }
 }
 
 async function mutateQueue(
@@ -179,7 +196,8 @@ async function handleMessage(message: unknown): Promise<Record<string, unknown>>
   if (request.type === "status") {
     const [settings, stored] = await Promise.all([getExtensionSettings(), chrome.storage.local.get(QUEUE_KEY)]) as [ExtensionSettings, { deliveryQueue?: DeliveryQueueState }];
     const queue = stored.deliveryQueue ?? newDeliveryQueue();
-    return { ok: true, trackingEnabled: settings.trackingEnabled, queueLength: queue.events.length, droppedCount: queue.droppedCount, lastError: queue.lastError, configured: Boolean(settings.token), collectorUrl: settings.collectorUrl };
+    const connection = await connectionState(settings, queue);
+    return { ok: true, trackingEnabled: settings.trackingEnabled, queueLength: queue.events.length, droppedCount: queue.droppedCount, lastError: queue.lastError, configured: Boolean(settings.token), collectorUrl: settings.collectorUrl, connectionStatus: connection.status, connectionLabel: statusLabel(connection.status), privacyDrift: connection.privacyDrift, privacySyncedAt: settings.privacySyncedAt };
   }
   if (request.type === "set-tracking") {
     const settings = await getExtensionSettings();
@@ -213,6 +231,9 @@ async function handleMessage(message: unknown): Promise<Record<string, unknown>>
   }
   if (request.type === "sync-control") {
     return { ok: await syncRemoteControl() };
+  }
+  if (request.type === "sync-privacy") {
+    return { ok: await syncPrivacyConfig() };
   }
   throw new Error("Unknown message type");
 }
@@ -267,6 +288,54 @@ async function syncRemoteControl(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function syncPrivacyConfig(): Promise<boolean> {
+  const settings = await getExtensionSettings();
+  if (!settings.token) return false;
+  try {
+    const response = await fetch(`${settings.collectorUrl.replace(/\/$/, "")}/api/privacy/config`, { headers: { authorization: `Bearer ${settings.token}` } });
+    if (!response.ok) return false;
+    const payload = await response.json() as { config?: unknown; version?: unknown };
+    if (!isPrivacyConfig(payload.config) || typeof payload.version !== "string") return false;
+    settings.remotePrivacy = payload.config;
+    settings.privacy = mergeRestrictivePrivacySettings(settings.privacy, payload.config);
+    settings.privacyConfigVersion = payload.version;
+    settings.privacySyncedAt = new Date().toISOString();
+    await saveExtensionSettings(settings);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function connectionState(settings: ExtensionSettings, queue: DeliveryQueueState): Promise<{ status: ConnectionStatus; privacyDrift: boolean }> {
+  if (!settings.token) return { status: "not-configured", privacyDrift: false };
+  if (queue.nextRetryAt > Date.now()) return { status: "queue-backing-off", privacyDrift: false };
+  try {
+    const diagnostic = await fetchConnectionDiagnostic(settings);
+    const privacyDrift = Boolean(settings.privacyConfigVersion && diagnostic.privacyConfigVersion && settings.privacyConfigVersion !== diagnostic.privacyConfigVersion);
+    if (privacyDrift) return { status: "connected-privacy-stale", privacyDrift };
+    if (!settings.trackingEnabled || diagnostic.trackingEnabled === false) return { status: "tracking-paused", privacyDrift };
+    return { status: "connected", privacyDrift };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    if (message.startsWith("Authentication failed")) return { status: "authentication-failed", privacyDrift: false };
+    if (message.startsWith("Collector schema")) return { status: "unsupported-schema", privacyDrift: false };
+    return { status: "collector-unavailable", privacyDrift: false };
+  }
+}
+
+function isPrivacyConfig(value: unknown): value is ExtensionSettings["privacy"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return Array.isArray(record.excludedDomains)
+    && Array.isArray(record.excludedUrlPatterns)
+    && (record.redactQueryValues === "all" || record.redactQueryValues === "sensitive" || record.redactQueryValues === "none")
+    && typeof record.removeFragments === "boolean"
+    && typeof record.redactLocalhostPaths === "boolean"
+    && typeof record.dropTrackingParameters === "boolean"
+    && typeof record.allowIncognito === "boolean";
 }
 
 void initialise();

@@ -9,6 +9,9 @@ export interface ExtensionSettings {
   browserProfileId: string;
   browser: "chrome" | "brave" | "chromium";
   privacy: PrivacySettings;
+  remotePrivacy: PrivacySettings | null;
+  privacyConfigVersion: string | null;
+  privacySyncedAt: string | null;
 }
 
 export const defaultExtensionSettings = (): ExtensionSettings => ({
@@ -20,6 +23,9 @@ export const defaultExtensionSettings = (): ExtensionSettings => ({
   browserProfileId: "chrome:Default",
   browser: detectBrowser(),
   privacy: structuredClone(defaultPrivacySettings),
+  remotePrivacy: null,
+  privacyConfigVersion: null,
+  privacySyncedAt: null,
 });
 
 export async function getExtensionSettings(): Promise<ExtensionSettings> {
@@ -29,17 +35,26 @@ export async function getExtensionSettings(): Promise<ExtensionSettings> {
     ...defaults,
     ...settings,
     privacy: { ...defaults.privacy, ...(settings?.privacy ?? {}) },
+    remotePrivacy: settings?.remotePrivacy ? { ...defaults.privacy, ...settings.remotePrivacy } : null,
+    privacyConfigVersion: settings?.privacyConfigVersion ?? null,
+    privacySyncedAt: settings?.privacySyncedAt ?? null,
   };
   if (!settings?.deviceId) await chrome.storage.local.set({ settings: merged });
   return merged;
 }
 
 export async function saveExtensionSettings(settings: ExtensionSettings): Promise<void> {
-  const collector = new URL(settings.collectorUrl);
+  validateCollectorUrl(settings.collectorUrl);
+  await chrome.storage.local.set({ settings });
+}
+
+export function validateCollectorUrl(value: string): URL {
+  let collector: URL;
+  try { collector = new URL(value); } catch { throw new Error("Collector URL must be a valid URL"); }
   if ((collector.protocol !== "http:" && collector.protocol !== "https:") || !isLoopback(collector.hostname)) {
     throw new Error("Collector must use localhost or a loopback IP address");
   }
-  await chrome.storage.local.set({ settings });
+  return collector;
 }
 
 function detectBrowser(): "chrome" | "brave" | "chromium" {

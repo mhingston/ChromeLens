@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ActiveInterval, ActivityEvent, ActivityEventType, CapturedIdea } from "../packages/domain/src/index.ts";
-import { deriveActiveIntervals, deriveFocusPeriods, groupResearchEpisodes } from "../packages/sessionisation/src/index.ts";
+import { countDomainTransitions, countTabTransitions, countUniqueContextBoundaries, deriveActiveIntervals, deriveFocusPeriods, groupResearchEpisodes } from "../packages/sessionisation/src/index.ts";
 
 function event(
   eventType: ActivityEventType,
@@ -33,6 +33,16 @@ function event(
 }
 
 describe("prospective activity derivation", () => {
+  it("counts a tab-and-domain transition as one unique context boundary", () => {
+    const intervals: ActiveInterval[] = [
+      { intervalId: "one", deviceId: "device", browserProfileId: null, browserSessionId: "session", tabId: "tab-a", startedAt: "2026-07-18T09:00:00.000Z", endedAt: "2026-07-18T09:05:00.000Z", durationMs: 300_000, url: "https://one.example", canonicalUrl: "https://one.example", domain: "one.example", title: "One", terminationReason: "tab_activated", derivationVersion: 1 },
+      { intervalId: "two", deviceId: "device", browserProfileId: null, browserSessionId: "session", tabId: "tab-b", startedAt: "2026-07-18T09:05:00.000Z", endedAt: "2026-07-18T09:06:00.000Z", durationMs: 60_000, url: "https://two.example", canonicalUrl: "https://two.example", domain: "two.example", title: "Two", terminationReason: "window_blurred", derivationVersion: 1 },
+    ];
+    expect(countTabTransitions(intervals)).toBe(1);
+    expect(countDomainTransitions(intervals)).toBe(1);
+    expect(countUniqueContextBoundaries(intervals)).toBe(1);
+  });
+
   it("accrues active time only while tab, focus, idle, tracking, and privacy conditions allow", () => {
     const tabA = { tabId: "session-test:A", url: "https://docs.example/a", canonicalUrl: "https://docs.example/a", domain: "docs.example", title: "A" };
     const tabB = { tabId: "session-test:B", url: "https://code.example/b", canonicalUrl: "https://code.example/b", domain: "code.example", title: "B" };

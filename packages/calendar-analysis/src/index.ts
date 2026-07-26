@@ -12,6 +12,19 @@ export interface ActivityWindowProjection {
   episodes: ResearchEpisode[];
 }
 
+export type CalendarRangeMode = "calendar_week" | "calendar_month" | "rolling_7" | "rolling_30" | "custom";
+
+export interface CalendarRange {
+  mode: CalendarRangeMode;
+  anchorDate: string;
+  from: string;
+  to: string;
+  dates: string[];
+  timeZone: string;
+  start: string;
+  end: string;
+}
+
 interface LocalParts {
   year: number;
   month: number;
@@ -54,6 +67,41 @@ export function calendarDates(from: string, to: string, maximumDays = 90): strin
     cursor = addCalendarDays(cursor, 1);
   }
   return dates;
+}
+
+export function calendarRange(
+  anchorDate: string,
+  timeZone: string,
+  mode: CalendarRangeMode,
+  customFrom?: string,
+  customTo?: string,
+): CalendarRange {
+  assertCalendarDate(anchorDate);
+  assertTimeZone(timeZone);
+  let from = anchorDate;
+  let to = anchorDate;
+  if (mode === "calendar_week") {
+    const weekday = new Date(`${anchorDate}T00:00:00.000Z`).getUTCDay();
+    const mondayOffset = weekday === 0 ? -6 : 1 - weekday;
+    from = addCalendarDays(anchorDate, mondayOffset);
+    to = addCalendarDays(from, 6);
+  } else if (mode === "calendar_month") {
+    from = `${anchorDate.slice(0, 7)}-01`;
+    const [year, month] = from.split("-").map(Number) as [number, number];
+    to = new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
+  } else if (mode === "rolling_7") {
+    from = addCalendarDays(anchorDate, -6);
+  } else if (mode === "rolling_30") {
+    from = addCalendarDays(anchorDate, -29);
+  } else if (mode === "custom") {
+    if (!customFrom || !customTo) throw new Error("Custom ranges require from and to dates");
+    from = customFrom;
+    to = customTo;
+  }
+  const dates = calendarDates(from, to, 90);
+  const first = calendarDayWindow(from, timeZone);
+  const last = calendarDayWindow(to, timeZone);
+  return { mode, anchorDate, from, to, dates, timeZone, start: first.start, end: last.end };
 }
 
 export function addCalendarDays(date: string, days: number): string {

@@ -4,4 +4,6 @@ Core behavior is built in vertical RED/GREEN slices and tested through public mo
 
 Coverage targets timestamp conversion, profile discovery, snapshot-based import and idempotency, schema variation, URL privacy and collector self-exclusion, authenticated ingestion, excluded-context handling, active-time state transitions, session boundaries, focus and switch metrics, deterministic episode evidence, real temporary Git commit collection, configurable output association, annotations, deletion, export, extension buffering behavior, and dashboard queries.
 
+The trust/correctness suite also covers authenticated diagnostics and invalid tokens, deterministic privacy fingerprints and restrictive merging, current-form extension diagnostic requests, typed collector error payloads, unique context-boundary counting, explicit calendar range generation, local-day Git UTC conversion, and historical hourly projection by IANA timezone. The validation suite is local because this repository has no attached GitHub Actions workflow.
+
 Final verification runs type checking, deterministic tests, production builds, collector integration checks, and headed Chrome-extension testing with `agent-browser`.

@@ -18,20 +18,26 @@ import type {
 } from "../../domain/src/index.ts";
 import { EPISODE_ANNOTATION_LABELS } from "../../domain/src/index.ts";
 import { associateOutputsToEpisodes, type OutputAssociationOptions } from "../../connectors/src/index.ts";
-import { sanitizeActivityEvent, type PrivacySettings } from "../../privacy/src/index.ts";
-import { deriveActiveIntervals, deriveFocusPeriods, groupResearchEpisodes } from "../../sessionisation/src/index.ts";
+import { isExcludedUrl, sanitizeActivityEvent, sanitizeUrlForDisplay, type PrivacySettings } from "../../privacy/src/index.ts";
+import { countDomainTransitions, countTabTransitions, countUniqueContextBoundaries, deriveActiveIntervals, deriveFocusPeriods, groupResearchEpisodes } from "../../sessionisation/src/index.ts";
 import {
   addCalendarDays,
   bucketActiveByLocalHour,
+  calendarRange,
   calendarDates,
   calendarDayWindow,
+  formatLocalDateTime,
   projectActivityWindow,
+  type CalendarRangeMode,
 } from "../../calendar-analysis/src/index.ts";
 import {
   createAnalysisExport as renderAnalysisExport,
   type AnalysisExportArtifact,
   type AnalysisExportOptions,
 } from "../../analysis-pack/src/index.ts";
+import { buildReviewItems } from "../../review/src/index.ts";
+import { buildAnnotationPatterns, buildInsights, buildResumeCandidates, type InsightMetrics } from "../../insights/src/index.ts";
+import { searchDocuments, type SearchResult } from "../../search/src/index.ts";
 
 export interface IngestionReport {
   received: number;
@@ -50,6 +56,8 @@ export interface DailySummary {
     ideaCount: number;
     tabSwitchCount: number;
     domainSwitchCount: number;
+    uniqueContextBoundaryCount: number;
+    uniqueContextBoundariesPerActiveHour: number;
     contextSwitchesPerActiveHour: number;
     outputCount: number;
   };
@@ -141,6 +149,21 @@ export interface HistoryImportBatch {
     startedAt: string;
     completedAt: string;
   };
+}
+
+export interface HistoricalSummaryOptions {
+  browser?: string;
+  profileId?: string;
+  privacy?: PrivacySettings;
+}
+
+export interface OverviewOptions {
+  mode?: CalendarRangeMode;
+  to?: string;
+  queuedEvents?: number;
+  droppedEvents?: number;
+  collectorRecentlyObserved?: boolean;
+  privacyDrift?: boolean;
 }
 
 export class ActivityStore {
@@ -563,8 +586,9 @@ export class ActivityStore {
       existing.intervalCount += 1;
       domainTotals.set(interval.domain, existing);
     }
-    const tabSwitchCount = episodes.reduce((sum, episode) => sum + episode.tabSwitchCount, 0);
-    const domainSwitchCount = episodes.reduce((sum, episode) => sum + episode.domainSwitchCount, 0);
+    const tabSwitchCount = countTabTransitions(intervals);
+    const domainSwitchCount = countDomainTransitions(intervals);
+    const uniqueContextBoundaryCount = countUniqueContextBoundaries(intervals);
     return {
       date,
       timeZone,
@@ -575,8 +599,13 @@ export class ActivityStore {
         outputCount: outputs.filter((output) => output.occurredAt >= start && output.occurredAt < end).length,
         tabSwitchCount,
         domainSwitchCount,
+        uniqueContextBoundaryCount,
+        uniqueContextBoundariesPerActiveHour: activeDurationMs > 0
+          ? (uniqueContextBoundaryCount * 3_600_000) / activeDurationMs
+          : 0,
+        // Kept for API compatibility with earlier local dashboards. New UI uses the explicit metric above.
         contextSwitchesPerActiveHour: activeDurationMs > 0
-          ? ((tabSwitchCount + domainSwitchCount) * 3_600_000) / activeDurationMs
+          ? (uniqueContextBoundaryCount * 3_600_000) / activeDurationMs
           : 0,
       },
       topDomains: [...domainTotals.entries()]
@@ -598,11 +627,19 @@ export class ActivityStore {
     };
   }
 
-  getRangeSummary(from: string, days: number, timeZone = "UTC"): Record<string, unknown> {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !Number.isInteger(days) || days < 1 || days > 31) {
-      throw new Error("Range requires YYYY-MM-DD and 1-31 days");
+  getRangeSummary(
+    from: string,
+    days: number,
+    timeZone = "UTC",
+    options: { mode?: CalendarRangeMode; to?: string } = {},
+  ): Record<string, unknown> {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !Number.isInteger(days) || days < 1 || days > 90) {
+      throw new Error("Range requires YYYY-MM-DD and 1-90 days");
     }
-    const daily = Array.from({ length: days }, (_, index) => this.getDailySummary(addCalendarDays(from, index), timeZone));
+    const range = options.mode
+      ? calendarRange(from, timeZone, options.mode, options.mode === "custom" ? from : undefined, options.mode === "custom" ? options.to : undefined)
+      : calendarRange(from, timeZone, "custom", from, addCalendarDays(from, days - 1));
+    const daily = range.dates.map((date) => this.getDailySummary(date, timeZone));
     const domainTotals = new Map<string, number>();
     const topics = new Map<string, number>();
     const focusDurations: number[] = [];
@@ -625,13 +662,17 @@ export class ActivityStore {
     const activeDurationMs = daily.reduce((sum, day) => sum + day.metrics.activeDurationMs, 0);
     const tabSwitchCount = daily.reduce((sum, day) => sum + day.metrics.tabSwitchCount, 0);
     const domainSwitchCount = daily.reduce((sum, day) => sum + day.metrics.domainSwitchCount, 0);
+    const uniqueContextBoundaryCount = daily.reduce((sum, day) => sum + day.metrics.uniqueContextBoundaryCount, 0);
     const activityByHour = bucketActiveByLocalHour(daily.flatMap((day) => day.intervals), timeZone);
     const outputsInRange = new Map(daily.flatMap((day) => day.outputs
       .filter((output) => output.occurredAt >= day.window.start && output.occurredAt < day.window.end)
       .map((output) => [output.outputId, output] as const)));
     return {
-      from,
-      days,
+      from: range.from,
+      to: range.to,
+      anchorDate: from,
+      mode: range.mode,
+      days: range.dates.length,
       timeZone,
       daily: daily.map((day) => ({ date: day.date, ...day.metrics })),
       metrics: {
@@ -639,10 +680,12 @@ export class ActivityStore {
         medianFocusDurationMs: median(focusDurations),
         tabSwitchCount,
         domainSwitchCount,
+        uniqueContextBoundaryCount,
+        uniqueContextBoundariesPerActiveHour: activeDurationMs ? (uniqueContextBoundaryCount * 3_600_000) / activeDurationMs : 0,
         ideaCount: daily.reduce((sum, day) => sum + day.metrics.ideaCount, 0),
         outputCount: outputsInRange.size,
         outputLinkedEpisodeCount: new Set([...outputsInRange.values()].map((output) => output.episodeId).filter(Boolean)).size,
-        contextSwitchesPerActiveHour: activeDurationMs ? ((tabSwitchCount + domainSwitchCount) * 3_600_000) / activeDurationMs : 0,
+        contextSwitchesPerActiveHour: activeDurationMs ? (uniqueContextBoundaryCount * 3_600_000) / activeDurationMs : 0,
       },
       topDomains: [...domainTotals.entries()].map(([domain, durationMs]) => ({ domain, activeDurationMs: durationMs })).sort((a, b) => b.activeDurationMs - a.activeDurationMs).slice(0, 12),
       topics: [...topics.entries()].map(([topic, durationMs]) => ({ topic, activeDurationMs: durationMs })).sort((a, b) => b.activeDurationMs - a.activeDurationMs).slice(0, 12),
@@ -652,26 +695,258 @@ export class ActivityStore {
     };
   }
 
-  getHistoricalSummary(): Record<string, unknown> {
-    const topDomains = this.database.prepare(`
-      SELECT domain, SUM(COALESCE(visit_count, 0)) AS visits, COUNT(*) AS pages
-      FROM historical_urls WHERE domain IS NOT NULL GROUP BY domain ORDER BY visits DESC LIMIT 20
-    `).all();
-    const revisitedPages = this.database.prepare(`
-      SELECT url, title, domain, visit_count, typed_count, last_visit_at
-      FROM historical_urls ORDER BY visit_count DESC LIMIT 20
-    `).all();
-    const visitsByHour = this.database.prepare(`
-      SELECT substr(visited_at, 12, 2) AS hour, COUNT(*) AS visits
-      FROM historical_visits GROUP BY hour ORDER BY hour
-    `).all();
+  getOverview(
+    from: string,
+    days: number,
+    timeZone = "UTC",
+    options: OverviewOptions = {},
+  ): Record<string, unknown> {
+    const range = options.mode
+      ? calendarRange(from, timeZone, options.mode, options.mode === "custom" ? from : undefined, options.mode === "custom" ? options.to : undefined)
+      : calendarRange(from, timeZone, "custom", from, addCalendarDays(from, days - 1));
+    const daily = range.dates.map((date) => this.getDailySummary(date, timeZone));
+    const episodes = uniqueById(daily.flatMap((day) => day.episodes), (episode) => episode.episodeId);
+    const outputs = uniqueById(daily.flatMap((day) => day.outputs), (output) => output.outputId);
+    const ideas = uniqueById(daily.flatMap((day) => day.ideas), (idea) => idea.ideaId);
+    const annotations = uniqueById(daily.flatMap((day) => day.annotations), (annotation) => annotation.annotationId);
+    const current = this.getRangeSummary(range.from, range.dates.length, timeZone, { mode: "custom", to: range.to });
+    const previousFrom = addCalendarDays(range.from, -range.dates.length);
+    const previousTo = addCalendarDays(previousFrom, range.dates.length - 1);
+    const previous = this.getRangeSummary(previousFrom, range.dates.length, timeZone, { mode: "custom", to: previousTo });
+    const latestEventAt = this.getLastObservedEventAt();
+    const healthOverrides = {
+      ...(options.droppedEvents === undefined ? {} : { droppedEvents: options.droppedEvents }),
+      ...(options.queuedEvents === undefined ? {} : { queuedEvents: options.queuedEvents }),
+      ...(options.collectorRecentlyObserved === undefined ? {} : { collectorRecentlyObserved: options.collectorRecentlyObserved }),
+      ...(options.privacyDrift === undefined ? {} : { privacyDrift: options.privacyDrift }),
+    };
+    const reviewItems = buildReviewItems({ episodes, annotations, outputs, ideas, ...healthOverrides });
+    const currentMetrics = current.metrics as InsightMetrics;
+    const previousMetrics = previous.metrics as InsightMetrics;
+    const insightIntervals = uniqueById(daily.flatMap((day) => day.intervals), (interval) => interval.intervalId);
+    const insightFocusPeriods = uniqueById(daily.flatMap((day) => day.focusPeriods), (period) => period.focusPeriodId);
+    const insights = buildInsights({
+      period: { from: range.from, to: range.to, timeZone },
+      current: { from: range.from, to: range.to, timeZone, days: range.dates.length, metrics: currentMetrics, daysWithActivity: daily.filter((day) => day.intervals.length > 0).length },
+      previous: { from: previousFrom, to: previousTo, timeZone, days: range.dates.length, metrics: previousMetrics, daysWithActivity: (previous.daily as Array<{ activeDurationMs: number }>).filter((day) => day.activeDurationMs > 0).length },
+      episodes,
+      intervals: insightIntervals,
+      focusPeriods: insightFocusPeriods,
+      outputs,
+      ideas,
+      annotations,
+      coverage: {
+        observedDays: range.dates.length,
+        daysWithActivity: daily.filter((day) => day.intervals.length > 0).length,
+        intervalCount: new Set(daily.flatMap((day) => day.intervals.map((interval) => interval.intervalId))).size,
+        lastObservedEventAt: latestEventAt,
+        ...healthOverrides,
+      },
+    });
     return {
-      ...this.getHistoricalStats(),
+      period: { mode: range.mode, from: range.from, to: range.to, timeZone: range.timeZone, days: range.dates.length },
+      coverage: {
+        observedDays: range.dates.length,
+        daysWithActivity: daily.filter((day) => day.intervals.length > 0).length,
+        intervalCount: new Set(daily.flatMap((day) => day.intervals.map((interval) => interval.intervalId))).size,
+        activeDurationMs: daily.reduce((sum, day) => sum + day.metrics.activeDurationMs, 0),
+        lastObservedEventAt: latestEventAt,
+        historicalVisits: this.getHistoricalStats().visits,
+        ...healthOverrides,
+      },
+      summary: current,
+      previousSummary: previous,
+      reviewItems,
+      insights,
+      recentIdeas: ideas.slice(-8).reverse(),
+      recentOutputs: outputs.slice(-8).reverse(),
+      resumeCandidates: buildResumeCandidates(episodes, insightIntervals, annotations),
+    };
+  }
+
+  getInsights(
+    from: string,
+    days: number,
+    timeZone = "UTC",
+    options: OverviewOptions = {},
+  ): Record<string, unknown> {
+    const overview = this.getOverview(from, days, timeZone, options);
+    return { period: overview.period, coverage: overview.coverage, insights: overview.insights };
+  }
+
+  search(query: string, limit = 50, timeZone = "UTC", privacy?: PrivacySettings): SearchResult[] {
+    if (!query.trim()) return [];
+    try { new Intl.DateTimeFormat("en", { timeZone }).format(0); }
+    catch { throw new Error("Invalid IANA time zone"); }
+    const documents = [] as Array<Parameters<typeof searchDocuments>[0][number]>;
+    const intervalRows = this.database.prepare("SELECT * FROM active_intervals ORDER BY started_at").all() as Array<Record<string, unknown>>;
+    for (const row of intervalRows) {
+      const interval = rowToInterval(row);
+      documents.push({ type: "interval", id: interval.intervalId, title: interval.title ?? interval.domain ?? "Observed interval", body: [interval.title, interval.domain, interval.url, interval.canonicalUrl].filter(Boolean).join(" "), date: localDate(interval.startedAt, timeZone), basis: "observed", target: interval.intervalId });
+    }
+    const episodeRows = this.database.prepare("SELECT * FROM research_episodes ORDER BY started_at").all() as Array<Record<string, unknown>>;
+    for (const row of episodeRows) {
+      const episode = rowToEpisode(row);
+      documents.push({ type: "episode", id: episode.episodeId, title: episode.topicLabel, body: [episode.topicLabel, ...episode.evidence].join(" "), date: localDate(episode.startedAt, timeZone), basis: episode.topicLabelSource === "user" ? "user_authored" : "derived", target: episode.episodeId });
+    }
+    for (const idea of this.readIdeas()) documents.push({ type: "idea", id: idea.ideaId, title: "Captured idea", body: [idea.text, ...idea.tags].join(" "), date: localDate(idea.capturedAt, timeZone), basis: "user_authored", target: idea.ideaId });
+    for (const annotation of this.readAnnotations()) documents.push({ type: "annotation", id: annotation.annotationId, title: annotation.label, body: [annotation.label, annotation.note].filter(Boolean).join(" "), date: localDate(annotation.createdAt, timeZone), basis: "user_authored", target: annotation.episodeId });
+    for (const output of this.readOutputs()) documents.push({ type: "output", id: output.outputId, title: output.title ?? output.reference ?? "Local output", body: [output.title, output.reference, output.repository, output.outputType].filter(Boolean).join(" "), date: localDate(output.occurredAt, timeZone), basis: "association", target: output.outputId });
+
+    const historyRows = this.database.prepare("SELECT * FROM historical_urls ORDER BY last_visit_at").all() as Array<Record<string, unknown>>;
+    const visibleHistory = historyRows.filter((row) => !privacy || !isExcludedUrl(String(row.url), privacy));
+    const visibleHistoryKeys = new Set(visibleHistory.map(historyRowKey));
+    for (const row of visibleHistory) {
+      const url = privacy ? sanitizeUrlForDisplay(String(row.url), privacy) : String(row.url);
+      documents.push({ type: "historical_page", id: historyRowKey(row), title: nullableString(row.title) ?? nullableString(row.domain) ?? "Historical page", body: [row.title, row.domain, url].filter(Boolean).join(" "), date: row.last_visit_at ? localDate(String(row.last_visit_at), timeZone) : null, basis: "observed", target: String(row.source_profile_id), ...(row.source_profile_id ? { profileId: String(row.source_profile_id) } : {}) });
+    }
+    const terms = this.database.prepare("SELECT term, source_browser, source_profile_id, source_url_id FROM historical_search_terms ORDER BY term").all() as Array<Record<string, unknown>>;
+    for (const row of terms) {
+      const key = `${String(row.source_browser)}\0${String(row.source_profile_id)}\0${String(row.source_url_id)}`;
+      if (!visibleHistoryKeys.has(key)) continue;
+      documents.push({ type: "historical_search", id: key, title: String(row.term), body: String(row.term), date: null, basis: "observed", target: String(row.source_profile_id), profileId: String(row.source_profile_id) });
+    }
+    return searchDocuments(documents, query, limit);
+  }
+
+  getPatterns(
+    from: string,
+    days: number,
+    timeZone = "UTC",
+    options: OverviewOptions = {},
+  ): Record<string, unknown> {
+    const overview = this.getOverview(from, days, timeZone, options);
+    const range = options.mode
+      ? calendarRange(from, timeZone, options.mode, options.mode === "custom" ? from : undefined, options.mode === "custom" ? options.to : undefined)
+      : calendarRange(from, timeZone, "custom", from, addCalendarDays(from, days - 1));
+    const daily = range.dates.map((date) => this.getDailySummary(date, timeZone));
+    const episodes = uniqueById(daily.flatMap((day) => day.episodes), (episode) => episode.episodeId);
+    const annotations = uniqueById(daily.flatMap((day) => day.annotations), (annotation) => annotation.annotationId);
+    return {
+      period: overview.period,
+      summary: overview.summary,
+      previousSummary: overview.previousSummary,
+      insights: overview.insights,
+      annotationPatterns: buildAnnotationPatterns(episodes, annotations),
+      resumeCandidates: overview.resumeCandidates,
+    };
+  }
+
+  getHistoricalSummary(timeZone = "UTC", options: HistoricalSummaryOptions = {}): Record<string, unknown> {
+    try { new Intl.DateTimeFormat("en", { timeZone }).format(0); }
+    catch { throw new Error("Invalid IANA time zone"); }
+    const allUrlRows = this.database.prepare("SELECT * FROM historical_urls ORDER BY last_visit_at").all() as Array<Record<string, unknown>>;
+    const visibleUrlRows = allUrlRows.filter((row) => !options.privacy || !isExcludedUrl(String(row.url), options.privacy));
+    const selectedUrlRows = visibleUrlRows.filter((row) => matchesHistoryProfile(row, options));
+    const visibleUrlKeys = new Set(visibleUrlRows.map(historyRowKey));
+    const selectedUrlKeys = new Set(selectedUrlRows.map(historyRowKey));
+    const allVisitRows = this.database.prepare("SELECT * FROM historical_visits ORDER BY visited_at").all() as Array<Record<string, unknown>>;
+    const visibleVisitRows = allVisitRows.filter((row) => visibleUrlKeys.has(historyRowKey(row)));
+    const selectedVisitRows = visibleVisitRows.filter((row) => selectedUrlKeys.has(historyRowKey(row)) && matchesHistoryProfile(row, options));
+    const displayUrl = (row: Record<string, unknown>): string | null => options.privacy
+      ? sanitizeUrlForDisplay(String(row.url), options.privacy)
+      : String(row.url);
+    const displayUrlByKey = new Map(selectedUrlRows.map((row) => [historyRowKey(row), displayUrl(row)] as const));
+    const visitTimesByUrl = new Map<string, string[]>();
+    for (const row of selectedVisitRows) {
+      const key = historyRowKey(row);
+      const values = visitTimesByUrl.get(key) ?? [];
+      values.push(String(row.visited_at));
+      visitTimesByUrl.set(key, values);
+    }
+    // History timestamps are stored as UTC instants. Project each visit into the requested
+    // IANA zone before grouping; grouping the raw ISO hour would mislabel local patterns.
+    const hourCounts = Array.from({ length: 24 }, () => 0);
+    for (const row of selectedVisitRows) {
+      const local = formatLocalDateTime(String(row.visited_at), timeZone);
+      hourCounts[Number(local.slice(11, 13))]! += 1;
+    }
+    const domainTotals = new Map<string, { visits: number; pages: number; firstVisitAt: string | null; latestVisitAt: string | null }>();
+    for (const row of selectedUrlRows) {
+      const domain = nullableString(row.domain);
+      if (!domain) continue;
+      const times = visitTimesByUrl.get(historyRowKey(row)) ?? [];
+      const existing = domainTotals.get(domain) ?? { visits: 0, pages: 0, firstVisitAt: null, latestVisitAt: null };
+      existing.visits += row.visit_count === null || row.visit_count === undefined ? times.length : Number(row.visit_count);
+      existing.pages += 1;
+      existing.firstVisitAt = minIso(existing.firstVisitAt, times[0] ?? null);
+      existing.latestVisitAt = maxIso(existing.latestVisitAt, times.at(-1) ?? null);
+      domainTotals.set(domain, existing);
+    }
+    const topDomains = [...domainTotals.entries()]
+      .map(([domain, values]) => ({ domain, ...values }))
+      .sort((left, right) => right.visits - left.visits || left.domain.localeCompare(right.domain))
+      .slice(0, 20);
+    const revisitedPages = selectedUrlRows
+      .filter((row) => row.visit_count !== null && Number(row.visit_count) > 1)
+      .map((row) => {
+        const times = visitTimesByUrl.get(historyRowKey(row)) ?? [];
+        return {
+          url: displayUrlByKey.get(historyRowKey(row)), title: nullableString(row.title), domain: nullableString(row.domain),
+          visitCount: row.visit_count === null || row.visit_count === undefined ? null : Number(row.visit_count),
+          typedCount: row.typed_count === null || row.typed_count === undefined ? null : Number(row.typed_count),
+          lastVisitAt: nullableString(row.last_visit_at), firstVisitAt: times[0] ?? null,
+          browser: String(row.source_browser), profileId: String(row.source_profile_id),
+        };
+      })
+      .sort((left, right) => (right.visitCount ?? 0) - (left.visitCount ?? 0) || (left.url ?? "").localeCompare(right.url ?? ""))
+      .slice(0, 20);
+    const searchTermRows = this.database.prepare("SELECT term, source_browser, source_profile_id, source_url_id FROM historical_search_terms ORDER BY term").all() as Array<Record<string, unknown>>;
+    const selectedSearchTerms = searchTermRows.filter((row) => {
+      const key = `${String(row.source_browser)}\0${String(row.source_profile_id)}\0${String(row.source_url_id)}`;
+      return visibleUrlKeys.has(key) && selectedUrlKeys.has(key);
+    });
+    const searchTermCounts = new Map<string, { term: string; browser: string; profileId: string; occurrences: number }>();
+    for (const row of selectedSearchTerms) {
+      const key = `${String(row.source_browser)}\0${String(row.source_profile_id)}\0${String(row.term)}`;
+      const existing = searchTermCounts.get(key) ?? { term: String(row.term), browser: String(row.source_browser), profileId: String(row.source_profile_id), occurrences: 0 };
+      existing.occurrences += 1;
+      searchTermCounts.set(key, existing);
+    }
+    const searchTerms = [...searchTermCounts.values()]
+      .sort((left, right) => right.occurrences - left.occurrences || left.term.localeCompare(right.term))
+      .slice(0, 50);
+    const profileCounts = new Map<string, { browser: string; profileId: string; visits: number; firstVisitAt: string | null; latestVisitAt: string | null }>();
+    for (const row of visibleVisitRows) {
+      const key = `${String(row.source_browser)}\0${String(row.source_profile_id)}`;
+      const existing = profileCounts.get(key) ?? { browser: String(row.source_browser), profileId: String(row.source_profile_id), visits: 0, firstVisitAt: null, latestVisitAt: null };
+      existing.visits += 1;
+      existing.firstVisitAt = minIso(existing.firstVisitAt, String(row.visited_at));
+      existing.latestVisitAt = maxIso(existing.latestVisitAt, String(row.visited_at));
+      profileCounts.set(key, existing);
+    }
+    const profileOptions = [...profileCounts.values()].sort((left, right) => left.browser.localeCompare(right.browser) || left.profileId.localeCompare(right.profileId));
+    const profiles = profileOptions.filter((profile) => (!options.browser || profile.browser === options.browser) && (!options.profileId || profile.profileId === options.profileId));
+    const importRuns = (this.database.prepare("SELECT import_id, source_browser, source_profile_id, source_schema_version, importer_version, fields_imported_json, started_at, completed_at, urls_seen, visits_seen, urls_inserted, visits_inserted FROM import_runs ORDER BY completed_at DESC").all() as Array<Record<string, unknown>>)
+      .filter((row) => (!options.browser || row.source_browser === options.browser) && (!options.profileId || row.source_profile_id === options.profileId));
+    const selectedStats = { urls: selectedUrlRows.length, visits: selectedVisitRows.length, searchTerms: selectedSearchTerms.length };
+    return {
+      ...selectedStats,
+      timeZone,
+      browser: options.browser ?? null,
+      profileId: options.profileId ?? null,
       topDomains,
       revisitedPages,
-      visitsByHour,
-      caveat: "Historical counts and browser-recorded elapsed duration cannot reconstruct foreground attention.",
+      visitsByHour: hourCounts.map((visits, hour) => ({ hour, visits })),
+      searchTerms: searchTerms.map((row) => ({
+        term: row.term, browser: row.browser, profileId: row.profileId, occurrences: row.occurrences,
+      })),
+      profiles,
+      profileOptions,
+      importRuns: importRuns.map((row) => ({
+        importId: String(row.import_id), browser: String(row.source_browser), profileId: String(row.source_profile_id),
+        schemaVersion: row.source_schema_version === null || row.source_schema_version === undefined ? null : Number(row.source_schema_version),
+        importerVersion: String(row.importer_version), fieldsImportedJson: String(row.fields_imported_json),
+        startedAt: String(row.started_at), completedAt: String(row.completed_at), urlsSeen: Number(row.urls_seen), visitsSeen: Number(row.visits_seen),
+        urlsInserted: Number(row.urls_inserted), visitsInserted: Number(row.visits_inserted),
+      })),
+      caveat: "Historical visits are browser-recorded evidence only. They are not prospective active intervals, focused attention, or productivity measures.",
     };
+  }
+
+  getLastObservedEventAt(): string | null {
+    const row = this.database.prepare("SELECT MAX(occurred_at) AS occurred_at FROM activity_events").get() as { occurred_at?: string | null } | undefined;
+    return row?.occurred_at ?? null;
   }
 
   readActivityEvents(): PersistedActivityEvent[] {
@@ -1052,6 +1327,41 @@ function parseStringArray(value: unknown): string[] {
   } catch {
     return [];
   }
+}
+
+function uniqueById<T>(values: T[], id: (value: T) => string): T[] {
+  const seen = new Set<string>();
+  return values.filter((value) => {
+    const key = id(value);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function historyRowKey(row: Record<string, unknown>): string {
+  return `${String(row.source_browser)}\0${String(row.source_profile_id)}\0${String(row.source_url_id)}`;
+}
+
+function matchesHistoryProfile(row: Record<string, unknown>, options: HistoricalSummaryOptions): boolean {
+  return (!options.browser || String(row.source_browser) === options.browser)
+    && (!options.profileId || String(row.source_profile_id) === options.profileId);
+}
+
+function minIso(current: string | null, candidate: string | null): string | null {
+  if (!current) return candidate;
+  if (!candidate) return current;
+  return candidate < current ? candidate : current;
+}
+
+function maxIso(current: string | null, candidate: string | null): string | null {
+  if (!current) return candidate;
+  if (!candidate) return current;
+  return candidate > current ? candidate : current;
+}
+
+function localDate(value: string, timeZone: string): string {
+  return formatLocalDateTime(value, timeZone).slice(0, 10);
 }
 
 function nullableString(value: unknown): string | null {

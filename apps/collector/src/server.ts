@@ -1,12 +1,14 @@
 import { timingSafeEqual } from "node:crypto";
+import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { extname, join } from "node:path";
 import { EPISODE_ANNOTATION_LABELS, isActivityEventType, type ActivityEvent, type EpisodeAnnotationLabel, type EpisodeCorrectionType } from "../../../packages/domain/src/index.ts";
-import { type ActivityStore } from "../../../packages/database/src/index.ts";
-import { defaultPrivacySettings, type PrivacySettings } from "../../../packages/privacy/src/index.ts";
+import { type ActivityStore, type OverviewOptions } from "../../../packages/database/src/index.ts";
+import { defaultPrivacySettings, serializePrivacySettings, type PrivacySettings } from "../../../packages/privacy/src/index.ts";
+import type { CalendarRangeMode } from "../../../packages/calendar-analysis/src/index.ts";
 import { discoverBrowserProfiles, importBrowserHistory } from "../../../packages/browser-history-import/src/index.ts";
 import { GitOutputConnector } from "../../../packages/connectors/src/index.ts";
 import type { AnalysisExportOptions } from "../../../packages/analysis-pack/src/index.ts";
@@ -23,6 +25,22 @@ export interface CollectorServerOptions {
 export interface CollectorServer {
   start(): Promise<string>;
   stop(): Promise<void>;
+}
+
+export interface ConnectionDiagnostic {
+  ok: true;
+  service: "chromelens";
+  schemaVersion: 1;
+  authenticated: true;
+  collectorTime: string;
+  trackingEnabled: boolean;
+  privacyConfigVersion: string;
+  lastObservedEventAt: string | null;
+  trackingControlEndpointReachable: true;
+  privacyConfigEndpointReachable: true;
+  queuedEvents: number;
+  droppedEvents: number;
+  privacyDrift: boolean;
 }
 
 export function createCollectorServer(options: CollectorServerOptions): CollectorServer {
@@ -88,6 +106,60 @@ async function handleRequest(
   }
   if (request.method === "GET" && url.pathname === "/api/control") {
     json(response, 200, control);
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/diagnostics/connection") {
+    const delivery = deliveryHealth(store);
+    const diagnostic: ConnectionDiagnostic = {
+      ok: true,
+      service: "chromelens",
+      schemaVersion: 1,
+      authenticated: true,
+      collectorTime: new Date().toISOString(),
+      trackingEnabled: control.trackingEnabled,
+      privacyConfigVersion: privacyVersion(privacySettings),
+      lastObservedEventAt: store.getLastObservedEventAt(),
+      trackingControlEndpointReachable: true,
+      privacyConfigEndpointReachable: true,
+      queuedEvents: delivery.queuedEvents,
+      droppedEvents: delivery.droppedEvents,
+      privacyDrift: delivery.privacyConfigVersion !== null && delivery.privacyConfigVersion !== privacyVersion(privacySettings),
+    };
+    json(response, 200, diagnostic);
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/diagnostics/status") {
+    const delivery = deliveryHealth(store);
+    json(response, 200, {
+      ok: true,
+      service: "chromelens",
+      schemaVersion: 1,
+      collectorTime: new Date().toISOString(),
+      trackingEnabled: control.trackingEnabled,
+      privacyConfigVersion: privacyVersion(privacySettings),
+      lastObservedEventAt: store.getLastObservedEventAt(),
+      queuedEvents: delivery.queuedEvents,
+      droppedEvents: delivery.droppedEvents,
+      privacyDrift: delivery.privacyConfigVersion !== null && delivery.privacyConfigVersion !== privacyVersion(privacySettings),
+    });
+    return;
+  }
+  if (request.method === "PUT" && url.pathname === "/api/diagnostics/delivery") {
+    const body = await readJson(request);
+    if (!isRecord(body) || !Number.isInteger(body.queuedEvents) || !Number.isInteger(body.droppedEvents)
+      || Number(body.queuedEvents) < 0 || Number(body.queuedEvents) > 5_000
+      || Number(body.droppedEvents) < 0 || Number(body.droppedEvents) > 5_000
+      || (body.privacyConfigVersion !== undefined && body.privacyConfigVersion !== null && typeof body.privacyConfigVersion !== "string")) {
+      json(response, 400, { error: "invalid_delivery_health", message: "queuedEvents and droppedEvents must be bounded integers" });
+      return;
+    }
+    const health = { queuedEvents: Number(body.queuedEvents), droppedEvents: Number(body.droppedEvents), privacyConfigVersion: typeof body.privacyConfigVersion === "string" ? body.privacyConfigVersion : null, reportedAt: new Date().toISOString() };
+    store.setSetting("deliveryHealth", health);
+    json(response, 200, health);
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/privacy/config") {
+    json(response, 200, { config: privacySettings, version: privacyVersion(privacySettings) });
     return;
   }
   if (request.method === "PUT" && url.pathname === "/api/control") {
@@ -158,6 +230,18 @@ async function handleRequest(
     json(response, 200, { privacy: updated });
     return;
   }
+  if (request.method === "PUT" && url.pathname === "/api/privacy/config") {
+    const body = await readJson(request);
+    if (!isRecord(body) || !isRecord(body.config)) {
+      json(response, 400, { error: "invalid_privacy_config", message: "config must be an object" });
+      return;
+    }
+    const updated = mergePrivacySettings(privacySettings, body.config);
+    Object.assign(privacySettings, updated);
+    store.setSetting("privacy", updated);
+    json(response, 200, { config: updated, version: privacyVersion(updated) });
+    return;
+  }
   if (request.method === "GET" && url.pathname === "/api/export/preview") {
     try {
       const artifact = store.createAnalysisExport(parseAnalysisExportOptions(url));
@@ -193,16 +277,79 @@ async function handleRequest(
     }
     return;
   }
+  if (request.method === "GET" && url.pathname === "/api/insights") {
+    const from = url.searchParams.get("from") ?? new Date().toISOString().slice(0, 10);
+    const days = Number(url.searchParams.get("days") ?? 7);
+    const timeZone = url.searchParams.get("timezone") ?? "UTC";
+    const to = url.searchParams.get("to") ?? undefined;
+    try {
+      const mode = parseRangeMode(url.searchParams.get("mode"));
+      json(response, 200, store.getInsights(from, days, timeZone, { ...(mode ? { mode } : {}), ...(to ? { to } : {}), ...overviewHealthOptions(store, privacySettings) }));
+    } catch (error) {
+      json(response, 400, { error: "invalid_insights", message: error instanceof Error ? error.message : "Invalid insight range" });
+    }
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/search") {
+    const query = url.searchParams.get("q") ?? "";
+    const limit = Number(url.searchParams.get("limit") ?? 50);
+    const timeZone = url.searchParams.get("timezone") ?? "UTC";
+    if (query.length > 200 || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+      json(response, 400, { error: "invalid_search", message: "q must be at most 200 characters and limit must be 1-100" });
+      return;
+    }
+    try { json(response, 200, { query, timeZone, results: store.search(query, limit, timeZone, privacySettings) }); }
+    catch (error) { json(response, 400, { error: "invalid_search", message: error instanceof Error ? error.message : "Invalid search" }); }
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/patterns") {
+    const from = url.searchParams.get("from") ?? new Date().toISOString().slice(0, 10);
+    const days = Number(url.searchParams.get("days") ?? 7);
+    const timeZone = url.searchParams.get("timezone") ?? "UTC";
+    const to = url.searchParams.get("to") ?? undefined;
+    try {
+      const mode = parseRangeMode(url.searchParams.get("mode"));
+      json(response, 200, store.getPatterns(from, days, timeZone, { ...(mode ? { mode } : {}), ...(to ? { to } : {}), ...overviewHealthOptions(store, privacySettings) }));
+    } catch (error) {
+      json(response, 400, { error: "invalid_patterns", message: error instanceof Error ? error.message : "Invalid patterns range" });
+    }
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/overview") {
+    const from = url.searchParams.get("from") ?? new Date().toISOString().slice(0, 10);
+    const days = Number(url.searchParams.get("days") ?? 7);
+    const timeZone = url.searchParams.get("timezone") ?? "UTC";
+    const to = url.searchParams.get("to") ?? undefined;
+    try {
+      const mode = parseRangeMode(url.searchParams.get("mode"));
+      json(response, 200, store.getOverview(from, days, timeZone, { ...(mode ? { mode } : {}), ...(to ? { to } : {}), ...overviewHealthOptions(store, privacySettings) }));
+    } catch (error) {
+      json(response, 400, { error: "invalid_overview", message: error instanceof Error ? error.message : "Invalid overview range" });
+    }
+    return;
+  }
   if (request.method === "GET" && url.pathname === "/api/summary/range") {
     const from = url.searchParams.get("from") ?? new Date().toISOString().slice(0, 10);
     const days = Number(url.searchParams.get("days") ?? 7);
     const timeZone = url.searchParams.get("timezone") ?? "UTC";
-    try { json(response, 200, store.getRangeSummary(from, days, timeZone)); }
+    const to = url.searchParams.get("to") ?? undefined;
+    try {
+      const mode = parseRangeMode(url.searchParams.get("mode"));
+      json(response, 200, store.getRangeSummary(from, days, timeZone, mode ? { mode, ...(to ? { to } : {}) } : {}));
+    }
     catch (error) { json(response, 400, { error: "invalid_range", message: error instanceof Error ? error.message : "Invalid range" }); }
     return;
   }
   if (request.method === "GET" && url.pathname === "/api/history/summary") {
-    json(response, 200, store.getHistoricalSummary());
+    const browser = url.searchParams.get("browser") || undefined;
+    const profileId = url.searchParams.get("profileId") || undefined;
+    if (browser && browser !== "chrome" && browser !== "brave") {
+      json(response, 400, { error: "invalid_history_filter", message: "browser must be chrome or brave" });
+      return;
+    }
+    const historyOptions = { privacy: privacySettings, ...(browser ? { browser } : {}), ...(profileId ? { profileId } : {}) };
+    try { json(response, 200, store.getHistoricalSummary(url.searchParams.get("timezone") ?? "UTC", historyOptions)); }
+    catch (error) { json(response, 400, { error: "invalid_timezone", message: error instanceof Error ? error.message : "Invalid time zone" }); }
     return;
   }
   if (request.method === "GET" && url.pathname === "/api/profiles") {
@@ -413,6 +560,8 @@ function parseAnalysisExportOptions(url: URL): AnalysisExportOptions {
     throw new Error("privacy must be aggregate, contextual, or detailed");
   }
   const maxTokens = Number(url.searchParams.get("maxTokens") ?? 50_000);
+  const question = url.searchParams.get("question") ?? undefined;
+  if (question && question.length > 1_000) throw new Error("question must be at most 1000 characters");
   return {
     from: requiredQueryParameter(url, "from"),
     to: requiredQueryParameter(url, "to"),
@@ -420,6 +569,7 @@ function parseAnalysisExportOptions(url: URL): AnalysisExportOptions {
     privacy,
     format,
     maxTokens,
+    ...(question ? { question } : {}),
   };
 }
 
@@ -432,6 +582,36 @@ function requiredQueryParameter(url: URL, name: string): string {
 function requiredString(value: unknown, name: string, maximum = 1_000): string {
   if (typeof value !== "string" || value.length === 0 || value.length > maximum) throw new Error(`${name} must be a non-empty string`);
   return value;
+}
+
+function privacyVersion(settings: PrivacySettings): string {
+  return `privacy_v1_${createHash("sha256").update(serializePrivacySettings(settings)).digest("hex").slice(0, 16)}`;
+}
+
+function deliveryHealth(store: ActivityStore): { queuedEvents: number; droppedEvents: number; privacyConfigVersion: string | null; reportedAt: string | null } {
+  const value = store.getSetting("deliveryHealth", { queuedEvents: 0, droppedEvents: 0, privacyConfigVersion: null as string | null, reportedAt: null as string | null });
+  return {
+    queuedEvents: Number.isInteger(value.queuedEvents) ? Math.max(0, Math.min(5_000, value.queuedEvents)) : 0,
+    droppedEvents: Number.isInteger(value.droppedEvents) ? Math.max(0, Math.min(5_000, value.droppedEvents)) : 0,
+    privacyConfigVersion: typeof value.privacyConfigVersion === "string" ? value.privacyConfigVersion : null,
+    reportedAt: typeof value.reportedAt === "string" ? value.reportedAt : null,
+  };
+}
+
+function overviewHealthOptions(store: ActivityStore, settings: PrivacySettings): OverviewOptions {
+  const delivery = deliveryHealth(store);
+  return {
+    queuedEvents: delivery.queuedEvents,
+    droppedEvents: delivery.droppedEvents,
+    ...(delivery.reportedAt ? { collectorRecentlyObserved: Date.now() - Date.parse(delivery.reportedAt) < 15 * 60_000 } : {}),
+    ...(delivery.privacyConfigVersion ? { privacyDrift: delivery.privacyConfigVersion !== privacyVersion(settings) } : {}),
+  };
+}
+
+function parseRangeMode(value: string | null): CalendarRangeMode | undefined {
+  if (!value) return undefined;
+  if (value === "calendar_week" || value === "calendar_month" || value === "rolling_7" || value === "rolling_30" || value === "custom") return value;
+  throw new Error("Unsupported range mode");
 }
 
 function optionalString(value: unknown, maximum = 1_000): string | null {

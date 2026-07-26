@@ -1,25 +1,19 @@
-import { getExtensionSettings, saveExtensionSettings } from "./settings.ts";
+import { fetchConnectionDiagnostic } from "./connection.ts";
+import { getExtensionSettings, saveExtensionSettings, type ExtensionSettings } from "./settings.ts";
 
 const form = document.querySelector<HTMLFormElement>("#settings-form")!;
 const feedback = document.querySelector<HTMLElement>("#feedback")!;
+let cachedSettings: ExtensionSettings | null = null;
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   feedback.textContent = "Saving…";
   try {
-    const settings = await getExtensionSettings();
-    settings.collectorUrl = value("collector-url").replace(/\/$/, "");
-    settings.token = value("token").trim();
-    settings.browserProfileId = value("profile-id").trim() || settings.browserProfileId;
-    settings.privacy.allowIncognito = checked("allow-incognito");
-    settings.privacy.redactLocalhostPaths = checked("redact-localhost");
-    settings.privacy.removeFragments = checked("remove-fragments");
-    settings.privacy.dropTrackingParameters = checked("drop-tracking");
-    settings.privacy.redactQueryValues = value("query-redaction") as "all" | "sensitive" | "none";
-    settings.privacy.excludedDomains = lines("excluded-domains");
-    settings.privacy.excludedUrlPatterns = lines("excluded-patterns");
+    const settings = formSettings();
     await saveExtensionSettings(settings);
+    cachedSettings = settings;
     await chrome.runtime.sendMessage({ type: "sync-control" });
+    await chrome.runtime.sendMessage({ type: "sync-privacy" });
     feedback.textContent = "Settings saved locally.";
   } catch (error) {
     feedback.textContent = error instanceof Error ? error.message : "Could not save settings.";
@@ -29,17 +23,34 @@ form.addEventListener("submit", async (event) => {
 document.querySelector("#test-collector")!.addEventListener("click", async () => {
   feedback.textContent = "Testing collector…";
   try {
-    const settings = await getExtensionSettings();
-    const response = await fetch(`${settings.collectorUrl}/api/health`);
-    if (!response.ok) throw new Error(`Collector returned ${response.status}`);
-    feedback.textContent = "Collector is reachable on loopback.";
+    const settings = formSettings();
+    if (!settings.token) throw new Error("Enter the bearer token before testing the connection.");
+    const diagnostic = await fetchConnectionDiagnostic(settings);
+    feedback.textContent = diagnostic.trackingEnabled ? "Connected and authenticated. Tracking is active." : "Connected and authenticated. Tracking is paused.";
   } catch (error) {
     feedback.textContent = error instanceof Error ? error.message : "Collector unavailable.";
   }
 });
 
+function formSettings(): ExtensionSettings {
+  if (!cachedSettings) throw new Error("Settings are still loading. Try again in a moment.");
+  const settings = structuredClone(cachedSettings);
+  settings.collectorUrl = value("collector-url").replace(/\/$/, "");
+  settings.token = value("token").trim();
+  settings.browserProfileId = value("profile-id").trim() || settings.browserProfileId;
+  settings.privacy.allowIncognito = checked("allow-incognito");
+  settings.privacy.redactLocalhostPaths = checked("redact-localhost");
+  settings.privacy.removeFragments = checked("remove-fragments");
+  settings.privacy.dropTrackingParameters = checked("drop-tracking");
+  settings.privacy.redactQueryValues = value("query-redaction") as "all" | "sensitive" | "none";
+  settings.privacy.excludedDomains = lines("excluded-domains");
+  settings.privacy.excludedUrlPatterns = lines("excluded-patterns");
+  return settings;
+}
+
 async function populate(): Promise<void> {
   const settings = await getExtensionSettings();
+  cachedSettings = settings;
   setValue("collector-url", settings.collectorUrl);
   setValue("token", settings.token);
   setValue("profile-id", settings.browserProfileId);

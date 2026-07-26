@@ -10,6 +10,37 @@ export interface PrivacySettings {
   allowIncognito: boolean;
 }
 
+/** A stable, order-independent representation for comparing shared privacy rules. */
+export function serializePrivacySettings(settings: PrivacySettings): string {
+  return JSON.stringify({
+    excludedDomains: [...settings.excludedDomains].map((value) => value.trim().toLowerCase()).filter(Boolean).sort(),
+    excludedUrlPatterns: [...settings.excludedUrlPatterns].map((value) => value.trim()).filter(Boolean).sort(),
+    redactQueryValues: settings.redactQueryValues,
+    removeFragments: settings.removeFragments,
+    redactLocalhostPaths: settings.redactLocalhostPaths,
+    dropTrackingParameters: settings.dropTrackingParameters,
+    allowIncognito: settings.allowIncognito,
+  });
+}
+
+/** Merge local emergency exclusions with the canonical collector rules. */
+export function mergeRestrictivePrivacySettings(local: PrivacySettings, remote: PrivacySettings): PrivacySettings {
+  const queryRank = { none: 0, sensitive: 1, all: 2 } as const;
+  const redactQueryValues = queryRank[local.redactQueryValues] >= queryRank[remote.redactQueryValues]
+    ? local.redactQueryValues
+    : remote.redactQueryValues;
+  return {
+    excludedDomains: [...new Set([...local.excludedDomains, ...remote.excludedDomains])].sort(),
+    excludedUrlPatterns: [...new Set([...local.excludedUrlPatterns, ...remote.excludedUrlPatterns])].sort(),
+    redactQueryValues,
+    removeFragments: local.removeFragments || remote.removeFragments,
+    redactLocalhostPaths: local.redactLocalhostPaths || remote.redactLocalhostPaths,
+    dropTrackingParameters: local.dropTrackingParameters || remote.dropTrackingParameters,
+    // A false value is the more restrictive interpretation of incognito access.
+    allowIncognito: local.allowIncognito && remote.allowIncognito,
+  };
+}
+
 export const defaultPrivacySettings: PrivacySettings = {
   excludedDomains: [
     "accounts.google.com",
@@ -101,6 +132,25 @@ export function isExcludedDomain(domain: string, exclusions: string[]): boolean 
     const excluded = entry.trim().toLowerCase().replace(/^\*\./, "").replace(/^\.+|\.+$/g, "");
     return excluded.length > 0 && (lower === excluded || lower.endsWith(`.${excluded}`));
   });
+}
+
+/** Returns true when a URL is outside the configured retention surface. */
+export function isExcludedUrl(rawUrl: string, settings: PrivacySettings): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    return !isTrackableProtocol(parsed.protocol)
+      || isExcludedDomain(parsed.hostname, settings.excludedDomains)
+      || matchesAnyPattern(rawUrl, settings.excludedUrlPatterns);
+  } catch {
+    return true;
+  }
+}
+
+/** Applies the configured URL redaction rules to a retained historical URL. */
+export function sanitizeUrlForDisplay(rawUrl: string, settings: PrivacySettings): string | null {
+  if (isExcludedUrl(rawUrl, settings)) return null;
+  try { return sanitizeUrl(new URL(rawUrl), settings); }
+  catch { return null; }
 }
 
 function sanitizeUrl(parsed: URL, settings: PrivacySettings): string {

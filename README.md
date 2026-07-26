@@ -13,7 +13,9 @@ The governing principle is simple: **browser activity is evidence about context,
 - Buffers events locally through collector outages with bounded storage, batching, retry, duplicate-safe IDs, and visible dropped-event counts.
 - Derives active foreground intervals, focus periods, tab/domain switches, and explainable research episodes from immutable events.
 - Collects commit metadata through a generic output-connector interface with an initial local Git connector, then associates outputs to the nearest episode inside a configurable evidence window.
-- Hosts an authenticated local daily/weekly/monthly dashboard with raw-evidence drill-down, linked outputs, episode annotations, privacy controls, profile import, export, and deletion.
+- Hosts an authenticated local Overview, Explore, daily/weekly/monthly dashboard with raw-evidence drill-down, review inbox, linked outputs, episode annotations, privacy controls, profile import, export, and deletion.
+- Provides a first-class History view for imported domains, revisited pages, search terms, local-time visit counts, browser/profile provenance, and import runs; historical visits remain visually and semantically separate from active foreground evidence.
+- Provides local cross-evidence search, deterministic Patterns and resume candidates, annotation-conditioned observations, and explicit analysis-question presets that are included in the previewed export manifest.
 - Projects UTC evidence into the dashboard's IANA time zone, clips intervals at local-day edges, and handles 23/25-hour daylight-saving days without double counting.
 - Previews and exports range-limited, token-budgeted LLM analysis packs as Markdown or JSONL with aggregate, contextual, and detailed privacy profiles.
 
@@ -98,7 +100,7 @@ Timestamps remain stored as UTC instants. Daily and hourly dashboard summaries a
 
 Press `Alt+Shift+I` or open the popup to attach an idea and optional tags to the current page. Selected text is never captured automatically. Use **Pause tracking** in the popup to stop event collection; the badge changes immediately and a pause/resume event preserves the interval boundary. The dashboard provides the same timestamped control: the collector enforces it immediately, and the extension reconciles the newest state on options save or its one-minute alarm.
 
-The extension options and dashboard expose exclusions and query redaction. Dashboard deletion accepts domain and time range; the collector interface additionally supports URL, browser session, and browser profile. Deletion removes matching raw facts and rebuilds derived data. JSON export is explicit and may contain sensitive locally retained facts—handle it accordingly.
+The extension options and dashboard expose exclusions and query redaction. The collector owns a versioned canonical privacy configuration at `/api/privacy/config`; the extension caches it and applies the restrictive union with local emergency exclusions before queueing. Offline operation uses the last verified cache, and the popup reports stale configuration separately from connectivity. Dashboard deletion accepts domain and time range; the collector interface additionally supports URL, browser session, and browser profile. Deletion removes matching raw facts and rebuilds derived data. JSON export is explicit and may contain sensitive locally retained facts—handle it accordingly.
 
 ## Local outputs and annotations
 
@@ -155,7 +157,13 @@ npm run build
 npm run verify
 ```
 
+`npm run verify` is the standard local gate for type checking, the Vitest suite, and a production build. The current suite contains 17 test files and 50 tests. On 2026-07-26, a clean Chromium smoke test against a temporary loopback collector authenticated successfully and exercised Overview review/delivery evidence, captured-idea continuity, Patterns domain evidence, the History evidence boundary, local search, and navigation between views. The smoke data and collector were isolated to a temporary directory and discarded after the run.
+
 Tests exercise public behavior with real temporary SQLite databases and Git repositories: timestamp conversion, multi-profile discovery, WAL snapshot imports, schema variation and idempotency, URL exclusions/redaction and collector self-exclusion, active-time event sequences, DST-safe calendar projection, focus periods, episode evidence, durable annotation reassociation, privacy-graded LLM exports, Git output collection/association, authenticated ingestion, deletion/rebuild, and offline delivery behavior. The final extension smoke test uses `agent-browser` against the built unpacked extension.
+
+The authenticated `/api/diagnostics/connection` endpoint verifies the bearer token, collector schema, tracking-control reachability, and canonical privacy version. Extension connection tests use the values currently in the form, including unsaved edits; they do not use the unauthenticated health route.
+
+Dashboard ranges identify their calendar or rolling mode, visible local start/end dates, and IANA timezone. Calendar months are actual month boundaries. Git collection from a dashboard day converts that local day to UTC before querying the repository. Tab transitions, domain transitions, and unique context boundaries are shown independently; a boundary where both tab and domain change is counted once.
 
 See [architecture](docs/architecture.md), [ADR 0001](docs/adr/0001-local-first-architecture.md), [schema notes](docs/browser-schema-notes.md), [metrics](docs/metrics.md), [privacy](docs/privacy.md), [threat model](docs/threat-model.md), [permissions](docs/extension-permissions.md), and [testing](docs/testing.md).
 

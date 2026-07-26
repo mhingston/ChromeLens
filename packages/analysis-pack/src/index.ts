@@ -19,6 +19,7 @@ export interface AnalysisExportOptions {
   privacy: AnalysisPrivacy;
   format: AnalysisExportFormat;
   maxTokens: number;
+  question?: string;
 }
 
 export interface AnalysisPackSourceDay {
@@ -304,6 +305,7 @@ function render(
     exportedAt,
     period: { from: options.from, to: options.to, timeZone: options.timeZone },
     privacy: options.privacy,
+    ...(options.question ? { question: options.question } : {}),
     source: "ChromeLens local derived evidence",
     counts: { includedDays: dailyRecords.length, totalDays, includedEpisodes: episodeRecords.length, totalEpisodes },
     recordPayloadSha256: hashRecords(records),
@@ -341,6 +343,7 @@ function renderBudgetExhausted(options: AnalysisExportOptions, exportedAt: strin
     exportedAt,
     period: { from: options.from, to: options.to, timeZone: options.timeZone },
     privacy: options.privacy,
+    ...(options.question ? { question: options.question } : {}),
     counts: { includedDays: 0, totalDays, includedEpisodes: 0, totalEpisodes },
     recordPayloadSha256: hashRecords([]),
     derivationVersions: { episodes: [] },
