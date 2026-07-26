@@ -161,6 +161,21 @@ async function flushQueue(): Promise<void> {
       return markDeliveryFailed(queue, Date.now(), error instanceof Error ? error.message : "Collector unavailable");
     }
   });
+  const stored = await chrome.storage.local.get(QUEUE_KEY) as { deliveryQueue?: DeliveryQueueState };
+  const queue = stored.deliveryQueue ?? newDeliveryQueue();
+  void reportDeliveryHealth(settings, queue);
+}
+
+async function reportDeliveryHealth(settings: ExtensionSettings, queue: DeliveryQueueState): Promise<void> {
+  try {
+    await fetch(`${settings.collectorUrl.replace(/\/$/, "")}/api/diagnostics/delivery`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", authorization: `Bearer ${settings.token}` },
+      body: JSON.stringify({ queuedEvents: queue.events.length, droppedEvents: queue.droppedCount, privacyConfigVersion: settings.privacyConfigVersion }),
+    });
+  } catch {
+    // Delivery health is advisory; local queueing must continue when the collector is offline.
+  }
 }
 
 async function mutateQueue(

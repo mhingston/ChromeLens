@@ -6,7 +6,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { extname, join } from "node:path";
 import { EPISODE_ANNOTATION_LABELS, isActivityEventType, type ActivityEvent, type EpisodeAnnotationLabel, type EpisodeCorrectionType } from "../../../packages/domain/src/index.ts";
-import { type ActivityStore } from "../../../packages/database/src/index.ts";
+import { type ActivityStore, type OverviewOptions } from "../../../packages/database/src/index.ts";
 import { defaultPrivacySettings, serializePrivacySettings, type PrivacySettings } from "../../../packages/privacy/src/index.ts";
 import type { CalendarRangeMode } from "../../../packages/calendar-analysis/src/index.ts";
 import { discoverBrowserProfiles, importBrowserHistory } from "../../../packages/browser-history-import/src/index.ts";
@@ -38,6 +38,9 @@ export interface ConnectionDiagnostic {
   lastObservedEventAt: string | null;
   trackingControlEndpointReachable: true;
   privacyConfigEndpointReachable: true;
+  queuedEvents: number;
+  droppedEvents: number;
+  privacyDrift: boolean;
 }
 
 export function createCollectorServer(options: CollectorServerOptions): CollectorServer {
@@ -106,6 +109,7 @@ async function handleRequest(
     return;
   }
   if (request.method === "GET" && url.pathname === "/api/diagnostics/connection") {
+    const delivery = deliveryHealth(store);
     const diagnostic: ConnectionDiagnostic = {
       ok: true,
       service: "chromelens",
@@ -117,11 +121,15 @@ async function handleRequest(
       lastObservedEventAt: store.getLastObservedEventAt(),
       trackingControlEndpointReachable: true,
       privacyConfigEndpointReachable: true,
+      queuedEvents: delivery.queuedEvents,
+      droppedEvents: delivery.droppedEvents,
+      privacyDrift: delivery.privacyConfigVersion !== null && delivery.privacyConfigVersion !== privacyVersion(privacySettings),
     };
     json(response, 200, diagnostic);
     return;
   }
   if (request.method === "GET" && url.pathname === "/api/diagnostics/status") {
+    const delivery = deliveryHealth(store);
     json(response, 200, {
       ok: true,
       service: "chromelens",
@@ -130,7 +138,24 @@ async function handleRequest(
       trackingEnabled: control.trackingEnabled,
       privacyConfigVersion: privacyVersion(privacySettings),
       lastObservedEventAt: store.getLastObservedEventAt(),
+      queuedEvents: delivery.queuedEvents,
+      droppedEvents: delivery.droppedEvents,
+      privacyDrift: delivery.privacyConfigVersion !== null && delivery.privacyConfigVersion !== privacyVersion(privacySettings),
     });
+    return;
+  }
+  if (request.method === "PUT" && url.pathname === "/api/diagnostics/delivery") {
+    const body = await readJson(request);
+    if (!isRecord(body) || !Number.isInteger(body.queuedEvents) || !Number.isInteger(body.droppedEvents)
+      || Number(body.queuedEvents) < 0 || Number(body.queuedEvents) > 5_000
+      || Number(body.droppedEvents) < 0 || Number(body.droppedEvents) > 5_000
+      || (body.privacyConfigVersion !== undefined && body.privacyConfigVersion !== null && typeof body.privacyConfigVersion !== "string")) {
+      json(response, 400, { error: "invalid_delivery_health", message: "queuedEvents and droppedEvents must be bounded integers" });
+      return;
+    }
+    const health = { queuedEvents: Number(body.queuedEvents), droppedEvents: Number(body.droppedEvents), privacyConfigVersion: typeof body.privacyConfigVersion === "string" ? body.privacyConfigVersion : null, reportedAt: new Date().toISOString() };
+    store.setSetting("deliveryHealth", health);
+    json(response, 200, health);
     return;
   }
   if (request.method === "GET" && url.pathname === "/api/privacy/config") {
@@ -259,7 +284,7 @@ async function handleRequest(
     const to = url.searchParams.get("to") ?? undefined;
     try {
       const mode = parseRangeMode(url.searchParams.get("mode"));
-      json(response, 200, store.getInsights(from, days, timeZone, mode ? { mode, ...(to ? { to } : {}) } : {}));
+      json(response, 200, store.getInsights(from, days, timeZone, { ...(mode ? { mode } : {}), ...(to ? { to } : {}), ...overviewHealthOptions(store, privacySettings) }));
     } catch (error) {
       json(response, 400, { error: "invalid_insights", message: error instanceof Error ? error.message : "Invalid insight range" });
     }
@@ -284,7 +309,7 @@ async function handleRequest(
     const to = url.searchParams.get("to") ?? undefined;
     try {
       const mode = parseRangeMode(url.searchParams.get("mode"));
-      json(response, 200, store.getPatterns(from, days, timeZone, mode ? { mode, ...(to ? { to } : {}) } : {}));
+      json(response, 200, store.getPatterns(from, days, timeZone, { ...(mode ? { mode } : {}), ...(to ? { to } : {}), ...overviewHealthOptions(store, privacySettings) }));
     } catch (error) {
       json(response, 400, { error: "invalid_patterns", message: error instanceof Error ? error.message : "Invalid patterns range" });
     }
@@ -297,7 +322,7 @@ async function handleRequest(
     const to = url.searchParams.get("to") ?? undefined;
     try {
       const mode = parseRangeMode(url.searchParams.get("mode"));
-      json(response, 200, store.getOverview(from, days, timeZone, mode ? { mode, ...(to ? { to } : {}) } : {}));
+      json(response, 200, store.getOverview(from, days, timeZone, { ...(mode ? { mode } : {}), ...(to ? { to } : {}), ...overviewHealthOptions(store, privacySettings) }));
     } catch (error) {
       json(response, 400, { error: "invalid_overview", message: error instanceof Error ? error.message : "Invalid overview range" });
     }
@@ -561,6 +586,26 @@ function requiredString(value: unknown, name: string, maximum = 1_000): string {
 
 function privacyVersion(settings: PrivacySettings): string {
   return `privacy_v1_${createHash("sha256").update(serializePrivacySettings(settings)).digest("hex").slice(0, 16)}`;
+}
+
+function deliveryHealth(store: ActivityStore): { queuedEvents: number; droppedEvents: number; privacyConfigVersion: string | null; reportedAt: string | null } {
+  const value = store.getSetting("deliveryHealth", { queuedEvents: 0, droppedEvents: 0, privacyConfigVersion: null as string | null, reportedAt: null as string | null });
+  return {
+    queuedEvents: Number.isInteger(value.queuedEvents) ? Math.max(0, Math.min(5_000, value.queuedEvents)) : 0,
+    droppedEvents: Number.isInteger(value.droppedEvents) ? Math.max(0, Math.min(5_000, value.droppedEvents)) : 0,
+    privacyConfigVersion: typeof value.privacyConfigVersion === "string" ? value.privacyConfigVersion : null,
+    reportedAt: typeof value.reportedAt === "string" ? value.reportedAt : null,
+  };
+}
+
+function overviewHealthOptions(store: ActivityStore, settings: PrivacySettings): OverviewOptions {
+  const delivery = deliveryHealth(store);
+  return {
+    queuedEvents: delivery.queuedEvents,
+    droppedEvents: delivery.droppedEvents,
+    ...(delivery.reportedAt ? { collectorRecentlyObserved: Date.now() - Date.parse(delivery.reportedAt) < 15 * 60_000 } : {}),
+    ...(delivery.privacyConfigVersion ? { privacyDrift: delivery.privacyConfigVersion !== privacyVersion(settings) } : {}),
+  };
 }
 
 function parseRangeMode(value: string | null): CalendarRangeMode | undefined {

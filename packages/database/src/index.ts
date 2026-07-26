@@ -157,6 +157,15 @@ export interface HistoricalSummaryOptions {
   privacy?: PrivacySettings;
 }
 
+export interface OverviewOptions {
+  mode?: CalendarRangeMode;
+  to?: string;
+  queuedEvents?: number;
+  droppedEvents?: number;
+  collectorRecentlyObserved?: boolean;
+  privacyDrift?: boolean;
+}
+
 export class ActivityStore {
   readonly database: DatabaseSync;
 
@@ -690,7 +699,7 @@ export class ActivityStore {
     from: string,
     days: number,
     timeZone = "UTC",
-    options: { mode?: CalendarRangeMode; to?: string } = {},
+    options: OverviewOptions = {},
   ): Record<string, unknown> {
     const range = options.mode
       ? calendarRange(from, timeZone, options.mode, options.mode === "custom" ? from : undefined, options.mode === "custom" ? options.to : undefined)
@@ -705,7 +714,13 @@ export class ActivityStore {
     const previousTo = addCalendarDays(previousFrom, range.dates.length - 1);
     const previous = this.getRangeSummary(previousFrom, range.dates.length, timeZone, { mode: "custom", to: previousTo });
     const latestEventAt = this.getLastObservedEventAt();
-    const reviewItems = buildReviewItems({ episodes, annotations, outputs, ideas });
+    const healthOverrides = {
+      ...(options.droppedEvents === undefined ? {} : { droppedEvents: options.droppedEvents }),
+      ...(options.queuedEvents === undefined ? {} : { queuedEvents: options.queuedEvents }),
+      ...(options.collectorRecentlyObserved === undefined ? {} : { collectorRecentlyObserved: options.collectorRecentlyObserved }),
+      ...(options.privacyDrift === undefined ? {} : { privacyDrift: options.privacyDrift }),
+    };
+    const reviewItems = buildReviewItems({ episodes, annotations, outputs, ideas, ...healthOverrides });
     const currentMetrics = current.metrics as InsightMetrics;
     const previousMetrics = previous.metrics as InsightMetrics;
     const insightIntervals = uniqueById(daily.flatMap((day) => day.intervals), (interval) => interval.intervalId);
@@ -725,6 +740,7 @@ export class ActivityStore {
         daysWithActivity: daily.filter((day) => day.intervals.length > 0).length,
         intervalCount: new Set(daily.flatMap((day) => day.intervals.map((interval) => interval.intervalId))).size,
         lastObservedEventAt: latestEventAt,
+        ...healthOverrides,
       },
     });
     return {
@@ -736,6 +752,7 @@ export class ActivityStore {
         activeDurationMs: daily.reduce((sum, day) => sum + day.metrics.activeDurationMs, 0),
         lastObservedEventAt: latestEventAt,
         historicalVisits: this.getHistoricalStats().visits,
+        ...healthOverrides,
       },
       summary: current,
       previousSummary: previous,
@@ -751,7 +768,7 @@ export class ActivityStore {
     from: string,
     days: number,
     timeZone = "UTC",
-    options: { mode?: CalendarRangeMode; to?: string } = {},
+    options: OverviewOptions = {},
   ): Record<string, unknown> {
     const overview = this.getOverview(from, days, timeZone, options);
     return { period: overview.period, coverage: overview.coverage, insights: overview.insights };
@@ -796,7 +813,7 @@ export class ActivityStore {
     from: string,
     days: number,
     timeZone = "UTC",
-    options: { mode?: CalendarRangeMode; to?: string } = {},
+    options: OverviewOptions = {},
   ): Record<string, unknown> {
     const overview = this.getOverview(from, days, timeZone, options);
     const range = options.mode

@@ -46,6 +46,8 @@ The collector exposes `/api/diagnostics/connection` as an authenticated health c
 
 Privacy configuration is owned by the collector and retrieved through `/api/privacy/config`. The extension stores the last verified remote version and applies a restrictive union with its local rules before queueing. The collector applies its canonical rules again before persistence. This preserves bounded offline delivery while ensuring a stale or less restrictive extension cache cannot weaken persistence privacy.
 
+The extension reports bounded delivery health through the authenticated `/api/diagnostics/delivery` endpoint after queue flush attempts. Queue length, dropped-event count, and privacy-version drift are advisory local health facts; reporting failures never block offline queueing.
+
 Range summaries accept explicit calendar-week, calendar-month, rolling-7, rolling-30, and custom modes. Local calendar boundaries are converted to UTC through `calendar-analysis` before database queries. Git collection uses the same local-day window, so output evidence and activity evidence share calendar semantics.
 
 The authenticated `/api/overview` route combines a selected range summary with an equal-length preceding-period comparison, evidence coverage, deterministic review items, recent ideas and outputs, and resume candidates. Review navigation returns to the day evidence surface; it does not turn associations or missing records into productivity judgements.

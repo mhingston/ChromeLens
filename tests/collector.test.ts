@@ -99,6 +99,8 @@ describe("loopback collector", () => {
     const insights = await fetch(`${address}/api/insights?from=2026-07-18&to=2026-07-18&days=1&mode=custom&timezone=UTC`, { headers });
     const patterns = await fetch(`${address}/api/patterns?from=2026-07-18&to=2026-07-18&days=1&mode=custom&timezone=UTC`, { headers });
     const search = await fetch(`${address}/api/search?q=Unlinked%20local&timezone=UTC`, { headers });
+    const delivery = await fetch(`${address}/api/diagnostics/delivery`, { method: "PUT", headers, body: JSON.stringify({ queuedEvents: 2, droppedEvents: 1, privacyConfigVersion: "stale-privacy-version" }) });
+    const coveredOverview = await fetch(`${address}/api/overview?from=2026-07-18&to=2026-07-18&days=1&mode=custom&timezone=UTC`, { headers });
     const body = await overview.json() as {
       period: { from: string; to: string; days: number };
       previousSummary: { from: string; to: string };
@@ -108,17 +110,22 @@ describe("loopback collector", () => {
     const insightBody = await insights.json() as { period: { from: string; to: string }; insights: Array<{ kind: string; evidenceRefs: unknown[] }> };
     const patternBody = await patterns.json() as { resumeCandidates: Array<{ episodeId: string }>; annotationPatterns: unknown[] };
     const searchBody = await search.json() as { results: Array<{ type: string; target: string; basis: string }> };
+    const coveredBody = await coveredOverview.json() as { coverage: { queuedEvents: number; droppedEvents: number; privacyDrift: boolean }; reviewItems: Array<{ kind: string }> };
 
     expect(ingestion.status).toBe(202);
     expect(overview.status).toBe(200);
     expect(insights.status).toBe(200);
     expect(patterns.status).toBe(200);
     expect(search.status).toBe(200);
+    expect(delivery.status).toBe(200);
+    expect(coveredOverview.status).toBe(200);
     expect(insightBody.period).toMatchObject({ from: "2026-07-18", to: "2026-07-18" });
     expect(insightBody.insights.some((insight) => insight.kind === "review" && insight.evidenceRefs.length > 0)).toBe(true);
     expect(patternBody.resumeCandidates).toHaveLength(1);
     expect(patternBody.annotationPatterns).toEqual([]);
     expect(searchBody.results[0]).toMatchObject({ type: "output", target: "output-without-episode", basis: "association" });
+    expect(coveredBody.coverage).toMatchObject({ queuedEvents: 2, droppedEvents: 1, privacyDrift: true });
+    expect(coveredBody.reviewItems.map((item) => item.kind)).toContain("coverage");
     expect(body.period).toMatchObject({ from: "2026-07-18", to: "2026-07-18", days: 1 });
     expect(body.previousSummary).toMatchObject({ from: "2026-07-17", to: "2026-07-17" });
     expect(body.reviewItems.map((item) => item.kind)).toEqual(["episode_label", "unlinked_output", "idea_without_output"]);
