@@ -15,6 +15,24 @@ afterEach(async () => {
 });
 
 describe("loopback collector", () => {
+  it("requires authentication for connection diagnostics and reports privacy version", async () => {
+    const root = await mkdtemp(join(tmpdir(), "chromelens-diagnostics-"));
+    const store = new ActivityStore(join(root, "collector.sqlite"));
+    const server = createCollectorServer({ store, token: "test-secret", host: "127.0.0.1", port: 0 });
+    running.push(server);
+    const address = await server.start();
+
+    const invalid = await fetch(`${address}/api/diagnostics/connection`, { headers: { authorization: "Bearer wrong-token" } });
+    const valid = await fetch(`${address}/api/diagnostics/connection`, { headers: { authorization: "Bearer test-secret" } });
+    const body = await valid.json() as Record<string, unknown>;
+
+    expect(invalid.status).toBe(401);
+    expect(valid.status).toBe(200);
+    expect(body).toMatchObject({ ok: true, authenticated: true, schemaVersion: 1, trackingEnabled: true, trackingControlEndpointReachable: true });
+    expect(body.privacyConfigVersion).toMatch(/^privacy_v1_[a-f0-9]{16}$/);
+    store.close();
+  });
+
   it("rejects unauthenticated ingestion and serves authenticated summaries on loopback", async () => {
     const root = await mkdtemp(join(tmpdir(), "chromelens-collector-"));
     const store = new ActivityStore(join(root, "collector.sqlite"));

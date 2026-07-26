@@ -17,17 +17,24 @@
       <button class="nav-button" data-view="settings"><span>⚙</span>Privacy & data</button>
     </nav>
     <div class="principle"><b>Context, not performance.</b><p>ChromeLens reports observed activity and keeps interpretation separate.</p></div>
-    <div class="local-status"><i></i><span>Local collector</span><strong>127.0.0.1</strong></div>
+    <div class="local-status" id="collector-health" data-state="unknown"><i></i><span>Collector status unknown</span><strong>127.0.0.1</strong></div>
   </aside>
 
   <main>
     <header class="topbar">
       <div><p class="eyebrow">BROWSING EVIDENCE / <span id="view-kicker">DAILY LENS</span></p><h1 id="view-title">A day in context.</h1></div>
-      <div class="date-controls" id="date-controls"><button id="previous-date" aria-label="Previous period">←</button><input id="date" type="date"><button id="next-date" aria-label="Next period">→</button></div>
+      <div class="date-controls" id="date-controls"><button id="previous-date" aria-label="Previous period">←</button><button id="today" aria-label="Go to today">Today</button><input id="date" type="date"><select id="range-mode" aria-label="Range mode"><option value="calendar_week">Calendar week</option><option value="calendar_month">Calendar month</option><option value="rolling_7">Rolling 7 days</option><option value="rolling_30">Rolling 30 days</option><option value="custom">Custom range</option></select><div id="custom-range" hidden><label>From <input id="custom-from" type="date"></label><label>To <input id="custom-to" type="date"></label></div><button id="next-date" aria-label="Next period">→</button></div>
     </header>
     <div id="notice" class="notice" hidden></div>
     <section id="content" aria-live="polite"><div class="loading">Focusing the lens…</div></section>
   </main>
+
+  <dialog id="evidence-drawer" aria-labelledby="evidence-drawer-title">
+    <div class="drawer-shell">
+      <div id="evidence-drawer-content"></div>
+      <button id="close-evidence-drawer" class="secondary" type="button">Close evidence</button>
+    </div>
+  </dialog>
 
   <dialog id="token-dialog">
     <form method="dialog" id="token-form">

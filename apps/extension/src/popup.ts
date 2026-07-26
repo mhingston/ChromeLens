@@ -6,6 +6,10 @@ interface Status {
   lastError: string | null;
   configured: boolean;
   collectorUrl: string;
+  connectionStatus: "not-configured" | "collector-unavailable" | "authentication-failed" | "unsupported-schema" | "queue-backing-off" | "connected" | "connected-privacy-stale" | "tracking-paused";
+  connectionLabel: string;
+  privacyDrift: boolean;
+  privacySyncedAt: string | null;
 }
 
 const statusPill = document.querySelector<HTMLElement>("#status-pill")!;
@@ -63,8 +67,9 @@ async function refresh(): Promise<void> {
   queue.textContent = String(status.queueLength);
   dropped.textContent = String(status.droppedCount);
   const connection = document.querySelector<HTMLElement>("#connection")!;
-  connection.textContent = !status.configured ? "Collector token needed" : status.lastError ? status.lastError : "Collector configured";
-  connection.dataset.state = !status.configured || status.lastError ? "warning" : "ok";
+  connection.textContent = status.lastError && status.connectionStatus !== "connected" ? `${status.connectionLabel}: ${status.lastError}` : status.connectionLabel;
+  connection.dataset.state = status.connectionStatus === "connected" || status.connectionStatus === "tracking-paused" ? "ok" : "warning";
+  connection.title = status.privacyDrift ? "The cached canonical privacy configuration is stale. Reopen settings or reconnect to synchronize." : status.privacySyncedAt ? `Privacy synced ${new Date(status.privacySyncedAt).toLocaleString()}` : "";
 }
 
 void refresh();

@@ -1,4 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
+import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { readFile } from "node:fs/promises";
@@ -6,7 +7,8 @@ import { homedir } from "node:os";
 import { extname, join } from "node:path";
 import { EPISODE_ANNOTATION_LABELS, isActivityEventType, type ActivityEvent, type EpisodeAnnotationLabel, type EpisodeCorrectionType } from "../../../packages/domain/src/index.ts";
 import { type ActivityStore } from "../../../packages/database/src/index.ts";
-import { defaultPrivacySettings, type PrivacySettings } from "../../../packages/privacy/src/index.ts";
+import { defaultPrivacySettings, serializePrivacySettings, type PrivacySettings } from "../../../packages/privacy/src/index.ts";
+import type { CalendarRangeMode } from "../../../packages/calendar-analysis/src/index.ts";
 import { discoverBrowserProfiles, importBrowserHistory } from "../../../packages/browser-history-import/src/index.ts";
 import { GitOutputConnector } from "../../../packages/connectors/src/index.ts";
 import type { AnalysisExportOptions } from "../../../packages/analysis-pack/src/index.ts";
@@ -23,6 +25,19 @@ export interface CollectorServerOptions {
 export interface CollectorServer {
   start(): Promise<string>;
   stop(): Promise<void>;
+}
+
+export interface ConnectionDiagnostic {
+  ok: true;
+  service: "chromelens";
+  schemaVersion: 1;
+  authenticated: true;
+  collectorTime: string;
+  trackingEnabled: boolean;
+  privacyConfigVersion: string;
+  lastObservedEventAt: string | null;
+  trackingControlEndpointReachable: true;
+  privacyConfigEndpointReachable: true;
 }
 
 export function createCollectorServer(options: CollectorServerOptions): CollectorServer {
@@ -88,6 +103,38 @@ async function handleRequest(
   }
   if (request.method === "GET" && url.pathname === "/api/control") {
     json(response, 200, control);
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/diagnostics/connection") {
+    const diagnostic: ConnectionDiagnostic = {
+      ok: true,
+      service: "chromelens",
+      schemaVersion: 1,
+      authenticated: true,
+      collectorTime: new Date().toISOString(),
+      trackingEnabled: control.trackingEnabled,
+      privacyConfigVersion: privacyVersion(privacySettings),
+      lastObservedEventAt: store.getLastObservedEventAt(),
+      trackingControlEndpointReachable: true,
+      privacyConfigEndpointReachable: true,
+    };
+    json(response, 200, diagnostic);
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/diagnostics/status") {
+    json(response, 200, {
+      ok: true,
+      service: "chromelens",
+      schemaVersion: 1,
+      collectorTime: new Date().toISOString(),
+      trackingEnabled: control.trackingEnabled,
+      privacyConfigVersion: privacyVersion(privacySettings),
+      lastObservedEventAt: store.getLastObservedEventAt(),
+    });
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/privacy/config") {
+    json(response, 200, { config: privacySettings, version: privacyVersion(privacySettings) });
     return;
   }
   if (request.method === "PUT" && url.pathname === "/api/control") {
@@ -158,6 +205,18 @@ async function handleRequest(
     json(response, 200, { privacy: updated });
     return;
   }
+  if (request.method === "PUT" && url.pathname === "/api/privacy/config") {
+    const body = await readJson(request);
+    if (!isRecord(body) || !isRecord(body.config)) {
+      json(response, 400, { error: "invalid_privacy_config", message: "config must be an object" });
+      return;
+    }
+    const updated = mergePrivacySettings(privacySettings, body.config);
+    Object.assign(privacySettings, updated);
+    store.setSetting("privacy", updated);
+    json(response, 200, { config: updated, version: privacyVersion(updated) });
+    return;
+  }
   if (request.method === "GET" && url.pathname === "/api/export/preview") {
     try {
       const artifact = store.createAnalysisExport(parseAnalysisExportOptions(url));
@@ -197,12 +256,17 @@ async function handleRequest(
     const from = url.searchParams.get("from") ?? new Date().toISOString().slice(0, 10);
     const days = Number(url.searchParams.get("days") ?? 7);
     const timeZone = url.searchParams.get("timezone") ?? "UTC";
-    try { json(response, 200, store.getRangeSummary(from, days, timeZone)); }
+    const to = url.searchParams.get("to") ?? undefined;
+    try {
+      const mode = parseRangeMode(url.searchParams.get("mode"));
+      json(response, 200, store.getRangeSummary(from, days, timeZone, mode ? { mode, ...(to ? { to } : {}) } : {}));
+    }
     catch (error) { json(response, 400, { error: "invalid_range", message: error instanceof Error ? error.message : "Invalid range" }); }
     return;
   }
   if (request.method === "GET" && url.pathname === "/api/history/summary") {
-    json(response, 200, store.getHistoricalSummary());
+    try { json(response, 200, store.getHistoricalSummary(url.searchParams.get("timezone") ?? "UTC")); }
+    catch (error) { json(response, 400, { error: "invalid_timezone", message: error instanceof Error ? error.message : "Invalid time zone" }); }
     return;
   }
   if (request.method === "GET" && url.pathname === "/api/profiles") {
@@ -432,6 +496,16 @@ function requiredQueryParameter(url: URL, name: string): string {
 function requiredString(value: unknown, name: string, maximum = 1_000): string {
   if (typeof value !== "string" || value.length === 0 || value.length > maximum) throw new Error(`${name} must be a non-empty string`);
   return value;
+}
+
+function privacyVersion(settings: PrivacySettings): string {
+  return `privacy_v1_${createHash("sha256").update(serializePrivacySettings(settings)).digest("hex").slice(0, 16)}`;
+}
+
+function parseRangeMode(value: string | null): CalendarRangeMode | undefined {
+  if (!value) return undefined;
+  if (value === "calendar_week" || value === "calendar_month" || value === "rolling_7" || value === "rolling_30" || value === "custom") return value;
+  throw new Error("Unsupported range mode");
 }
 
 function optionalString(value: unknown, maximum = 1_000): string | null {

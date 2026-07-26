@@ -39,6 +39,12 @@ Selected local calendar range
 
 Tracking control is a timestamped local state shared through the authenticated collector. Dashboard changes are enforced by the collector immediately; the extension reconciles the newest local/collector state on its one-minute alarm and when options are saved, so an offline popup pause remains authoritative when connectivity returns.
 
+The collector exposes `/api/diagnostics/connection` as an authenticated health contract. It reports the supported API schema, tracking state, last observed event, tracking-control reachability, and a deterministic version of the canonical privacy configuration. `/api/health` remains a minimal unauthenticated liveness route and is not sufficient for extension connection trust.
+
+Privacy configuration is owned by the collector and retrieved through `/api/privacy/config`. The extension stores the last verified remote version and applies a restrictive union with its local rules before queueing. The collector applies its canonical rules again before persistence. This preserves bounded offline delivery while ensuring a stale or less restrictive extension cache cannot weaken persistence privacy.
+
+Range summaries accept explicit calendar-week, calendar-month, rolling-7, rolling-30, and custom modes. Local calendar boundaries are converted to UTC through `calendar-analysis` before database queries. Git collection uses the same local-day window, so output evidence and activity evidence share calendar semantics.
+
 Complexity is kept behind these interfaces. SQLite, the filesystem, Chrome APIs, HTTP, time, and Git are adapters at real seams; domain tests exercise public behavior rather than private helpers.
 
 Accepted event batches recompute active intervals only for affected browser sessions, then regroup episodes from stored intervals. Human annotations store interval/time anchors and are re-associated across derivation identity changes. Rename, split-before, and merge-before corrections are separate user-authored facts anchored to stable interval IDs and applied by sessionisation during every regrouping. Schema migrations add durable fields to existing local databases without discarding records.

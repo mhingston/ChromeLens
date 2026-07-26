@@ -19,13 +19,16 @@ import type {
 import { EPISODE_ANNOTATION_LABELS } from "../../domain/src/index.ts";
 import { associateOutputsToEpisodes, type OutputAssociationOptions } from "../../connectors/src/index.ts";
 import { sanitizeActivityEvent, type PrivacySettings } from "../../privacy/src/index.ts";
-import { deriveActiveIntervals, deriveFocusPeriods, groupResearchEpisodes } from "../../sessionisation/src/index.ts";
+import { countDomainTransitions, countTabTransitions, countUniqueContextBoundaries, deriveActiveIntervals, deriveFocusPeriods, groupResearchEpisodes } from "../../sessionisation/src/index.ts";
 import {
   addCalendarDays,
   bucketActiveByLocalHour,
+  calendarRange,
   calendarDates,
   calendarDayWindow,
+  formatLocalDateTime,
   projectActivityWindow,
+  type CalendarRangeMode,
 } from "../../calendar-analysis/src/index.ts";
 import {
   createAnalysisExport as renderAnalysisExport,
@@ -50,6 +53,8 @@ export interface DailySummary {
     ideaCount: number;
     tabSwitchCount: number;
     domainSwitchCount: number;
+    uniqueContextBoundaryCount: number;
+    uniqueContextBoundariesPerActiveHour: number;
     contextSwitchesPerActiveHour: number;
     outputCount: number;
   };
@@ -563,8 +568,9 @@ export class ActivityStore {
       existing.intervalCount += 1;
       domainTotals.set(interval.domain, existing);
     }
-    const tabSwitchCount = episodes.reduce((sum, episode) => sum + episode.tabSwitchCount, 0);
-    const domainSwitchCount = episodes.reduce((sum, episode) => sum + episode.domainSwitchCount, 0);
+    const tabSwitchCount = countTabTransitions(intervals);
+    const domainSwitchCount = countDomainTransitions(intervals);
+    const uniqueContextBoundaryCount = countUniqueContextBoundaries(intervals);
     return {
       date,
       timeZone,
@@ -575,8 +581,13 @@ export class ActivityStore {
         outputCount: outputs.filter((output) => output.occurredAt >= start && output.occurredAt < end).length,
         tabSwitchCount,
         domainSwitchCount,
+        uniqueContextBoundaryCount,
+        uniqueContextBoundariesPerActiveHour: activeDurationMs > 0
+          ? (uniqueContextBoundaryCount * 3_600_000) / activeDurationMs
+          : 0,
+        // Kept for API compatibility with earlier local dashboards. New UI uses the explicit metric above.
         contextSwitchesPerActiveHour: activeDurationMs > 0
-          ? ((tabSwitchCount + domainSwitchCount) * 3_600_000) / activeDurationMs
+          ? (uniqueContextBoundaryCount * 3_600_000) / activeDurationMs
           : 0,
       },
       topDomains: [...domainTotals.entries()]
@@ -598,11 +609,19 @@ export class ActivityStore {
     };
   }
 
-  getRangeSummary(from: string, days: number, timeZone = "UTC"): Record<string, unknown> {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !Number.isInteger(days) || days < 1 || days > 31) {
-      throw new Error("Range requires YYYY-MM-DD and 1-31 days");
+  getRangeSummary(
+    from: string,
+    days: number,
+    timeZone = "UTC",
+    options: { mode?: CalendarRangeMode; to?: string } = {},
+  ): Record<string, unknown> {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !Number.isInteger(days) || days < 1 || days > 90) {
+      throw new Error("Range requires YYYY-MM-DD and 1-90 days");
     }
-    const daily = Array.from({ length: days }, (_, index) => this.getDailySummary(addCalendarDays(from, index), timeZone));
+    const range = options.mode
+      ? calendarRange(from, timeZone, options.mode, options.mode === "custom" ? from : undefined, options.mode === "custom" ? options.to : undefined)
+      : calendarRange(from, timeZone, "custom", from, addCalendarDays(from, days - 1));
+    const daily = range.dates.map((date) => this.getDailySummary(date, timeZone));
     const domainTotals = new Map<string, number>();
     const topics = new Map<string, number>();
     const focusDurations: number[] = [];
@@ -625,13 +644,17 @@ export class ActivityStore {
     const activeDurationMs = daily.reduce((sum, day) => sum + day.metrics.activeDurationMs, 0);
     const tabSwitchCount = daily.reduce((sum, day) => sum + day.metrics.tabSwitchCount, 0);
     const domainSwitchCount = daily.reduce((sum, day) => sum + day.metrics.domainSwitchCount, 0);
+    const uniqueContextBoundaryCount = daily.reduce((sum, day) => sum + day.metrics.uniqueContextBoundaryCount, 0);
     const activityByHour = bucketActiveByLocalHour(daily.flatMap((day) => day.intervals), timeZone);
     const outputsInRange = new Map(daily.flatMap((day) => day.outputs
       .filter((output) => output.occurredAt >= day.window.start && output.occurredAt < day.window.end)
       .map((output) => [output.outputId, output] as const)));
     return {
-      from,
-      days,
+      from: range.from,
+      to: range.to,
+      anchorDate: from,
+      mode: range.mode,
+      days: range.dates.length,
       timeZone,
       daily: daily.map((day) => ({ date: day.date, ...day.metrics })),
       metrics: {
@@ -639,10 +662,12 @@ export class ActivityStore {
         medianFocusDurationMs: median(focusDurations),
         tabSwitchCount,
         domainSwitchCount,
+        uniqueContextBoundaryCount,
+        uniqueContextBoundariesPerActiveHour: activeDurationMs ? (uniqueContextBoundaryCount * 3_600_000) / activeDurationMs : 0,
         ideaCount: daily.reduce((sum, day) => sum + day.metrics.ideaCount, 0),
         outputCount: outputsInRange.size,
         outputLinkedEpisodeCount: new Set([...outputsInRange.values()].map((output) => output.episodeId).filter(Boolean)).size,
-        contextSwitchesPerActiveHour: activeDurationMs ? ((tabSwitchCount + domainSwitchCount) * 3_600_000) / activeDurationMs : 0,
+        contextSwitchesPerActiveHour: activeDurationMs ? (uniqueContextBoundaryCount * 3_600_000) / activeDurationMs : 0,
       },
       topDomains: [...domainTotals.entries()].map(([domain, durationMs]) => ({ domain, activeDurationMs: durationMs })).sort((a, b) => b.activeDurationMs - a.activeDurationMs).slice(0, 12),
       topics: [...topics.entries()].map(([topic, durationMs]) => ({ topic, activeDurationMs: durationMs })).sort((a, b) => b.activeDurationMs - a.activeDurationMs).slice(0, 12),
@@ -652,26 +677,85 @@ export class ActivityStore {
     };
   }
 
-  getHistoricalSummary(): Record<string, unknown> {
-    const topDomains = this.database.prepare(`
-      SELECT domain, SUM(COALESCE(visit_count, 0)) AS visits, COUNT(*) AS pages
-      FROM historical_urls WHERE domain IS NOT NULL GROUP BY domain ORDER BY visits DESC LIMIT 20
-    `).all();
-    const revisitedPages = this.database.prepare(`
-      SELECT url, title, domain, visit_count, typed_count, last_visit_at
-      FROM historical_urls ORDER BY visit_count DESC LIMIT 20
-    `).all();
-    const visitsByHour = this.database.prepare(`
-      SELECT substr(visited_at, 12, 2) AS hour, COUNT(*) AS visits
-      FROM historical_visits GROUP BY hour ORDER BY hour
-    `).all();
+  getHistoricalSummary(timeZone = "UTC"): Record<string, unknown> {
+    try { new Intl.DateTimeFormat("en", { timeZone }).format(0); }
+    catch { throw new Error("Invalid IANA time zone"); }
+    // History timestamps are stored as UTC instants. Project each visit into the requested
+    // IANA zone before grouping; grouping the raw ISO hour would mislabel local patterns.
+    const historicalVisits = this.database.prepare("SELECT visited_at FROM historical_visits ORDER BY visited_at").all() as Array<Record<string, unknown>>;
+    const hourCounts = Array.from({ length: 24 }, () => 0);
+    for (const row of historicalVisits) {
+      const local = formatLocalDateTime(String(row.visited_at), timeZone);
+      hourCounts[Number(local.slice(11, 13))]! += 1;
+    }
+    const topDomainRows = this.database.prepare(`
+      SELECT u.domain, SUM(COALESCE(u.visit_count, 0)) AS visits, COUNT(*) AS pages,
+        MIN(v.visited_at) AS first_visit_at, MAX(v.visited_at) AS latest_visit_at
+      FROM historical_urls u LEFT JOIN historical_visits v
+        ON v.source_browser = u.source_browser AND v.source_profile_id = u.source_profile_id AND v.source_url_id = u.source_url_id
+      WHERE u.domain IS NOT NULL GROUP BY u.domain ORDER BY visits DESC LIMIT 20
+    `).all() as Array<Record<string, unknown>>;
+    const topDomains = topDomainRows.map((row) => ({
+      domain: nullableString(row.domain), visits: Number(row.visits), pages: Number(row.pages),
+      firstVisitAt: nullableString(row.first_visit_at), latestVisitAt: nullableString(row.latest_visit_at),
+    }));
+    const revisitedPageRows = this.database.prepare(`
+      SELECT u.url, u.title, u.domain, u.visit_count, u.typed_count, u.last_visit_at,
+        u.source_browser, u.source_profile_id, MIN(v.visited_at) AS first_visit_at
+      FROM historical_urls u LEFT JOIN historical_visits v
+        ON v.source_browser = u.source_browser AND v.source_profile_id = u.source_profile_id AND v.source_url_id = u.source_url_id
+      GROUP BY u.source_browser, u.source_profile_id, u.source_url_id
+      ORDER BY u.visit_count DESC LIMIT 20
+    `).all() as Array<Record<string, unknown>>;
+    const revisitedPages = revisitedPageRows.map((row) => ({
+      url: String(row.url), title: nullableString(row.title), domain: nullableString(row.domain),
+      visitCount: row.visit_count === null || row.visit_count === undefined ? null : Number(row.visit_count),
+      typedCount: row.typed_count === null || row.typed_count === undefined ? null : Number(row.typed_count),
+      lastVisitAt: nullableString(row.last_visit_at), firstVisitAt: nullableString(row.first_visit_at),
+      browser: String(row.source_browser), profileId: String(row.source_profile_id),
+    }));
+    const searchTermRows = this.database.prepare(`
+      SELECT term, source_browser, source_profile_id, COUNT(*) AS occurrences
+      FROM historical_search_terms GROUP BY term, source_browser, source_profile_id ORDER BY occurrences DESC, term LIMIT 50
+    `).all() as Array<Record<string, unknown>>;
+    const searchTerms = searchTermRows.map((row) => ({
+      term: String(row.term), browser: String(row.source_browser), profileId: String(row.source_profile_id), occurrences: Number(row.occurrences),
+    }));
+    const profileRows = this.database.prepare(`
+      SELECT source_browser, source_profile_id, COUNT(*) AS visits, MIN(visited_at) AS first_visit_at, MAX(visited_at) AS latest_visit_at
+      FROM historical_visits GROUP BY source_browser, source_profile_id ORDER BY source_browser, source_profile_id
+    `).all() as Array<Record<string, unknown>>;
+    const profiles = profileRows.map((row) => ({
+      browser: String(row.source_browser), profileId: String(row.source_profile_id), visits: Number(row.visits),
+      firstVisitAt: nullableString(row.first_visit_at), latestVisitAt: nullableString(row.latest_visit_at),
+    }));
+    const importRuns = this.database.prepare(`
+      SELECT import_id, source_browser, source_profile_id, source_schema_version, importer_version,
+        fields_imported_json, started_at, completed_at, urls_seen, visits_seen, urls_inserted, visits_inserted
+      FROM import_runs ORDER BY completed_at DESC
+    `).all() as Array<Record<string, unknown>>;
     return {
       ...this.getHistoricalStats(),
+      timeZone,
       topDomains,
       revisitedPages,
-      visitsByHour,
+      visitsByHour: hourCounts.map((visits, hour) => ({ hour, visits })),
+      searchTerms,
+      profiles,
+      importRuns: importRuns.map((row) => ({
+        importId: String(row.import_id), browser: String(row.source_browser), profileId: String(row.source_profile_id),
+        schemaVersion: row.source_schema_version === null || row.source_schema_version === undefined ? null : Number(row.source_schema_version),
+        importerVersion: String(row.importer_version), fieldsImportedJson: String(row.fields_imported_json),
+        startedAt: String(row.started_at), completedAt: String(row.completed_at), urlsSeen: Number(row.urls_seen), visitsSeen: Number(row.visits_seen),
+        urlsInserted: Number(row.urls_inserted), visitsInserted: Number(row.visits_inserted),
+      })),
       caveat: "Historical counts and browser-recorded elapsed duration cannot reconstruct foreground attention.",
     };
+  }
+
+  getLastObservedEventAt(): string | null {
+    const row = this.database.prepare("SELECT MAX(occurred_at) AS occurred_at FROM activity_events").get() as { occurred_at?: string | null } | undefined;
+    return row?.occurred_at ?? null;
   }
 
   readActivityEvents(): PersistedActivityEvent[] {
