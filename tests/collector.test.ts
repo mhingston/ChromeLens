@@ -96,15 +96,20 @@ describe("loopback collector", () => {
       ] }),
     });
     const overview = await fetch(`${address}/api/overview?from=2026-07-18&to=2026-07-18&days=1&mode=custom&timezone=UTC`, { headers });
+    const insights = await fetch(`${address}/api/insights?from=2026-07-18&to=2026-07-18&days=1&mode=custom&timezone=UTC`, { headers });
     const body = await overview.json() as {
       period: { from: string; to: string; days: number };
       previousSummary: { from: string; to: string };
       reviewItems: Array<{ kind: string; evidenceRefs: unknown[] }>;
       resumeCandidates: Array<{ episodeId: string }>;
     };
+    const insightBody = await insights.json() as { period: { from: string; to: string }; insights: Array<{ kind: string; evidenceRefs: unknown[] }> };
 
     expect(ingestion.status).toBe(202);
     expect(overview.status).toBe(200);
+    expect(insights.status).toBe(200);
+    expect(insightBody.period).toMatchObject({ from: "2026-07-18", to: "2026-07-18" });
+    expect(insightBody.insights.some((insight) => insight.kind === "review" && insight.evidenceRefs.length > 0)).toBe(true);
     expect(body.period).toMatchObject({ from: "2026-07-18", to: "2026-07-18", days: 1 });
     expect(body.previousSummary).toMatchObject({ from: "2026-07-17", to: "2026-07-17" });
     expect(body.reviewItems.map((item) => item.kind)).toEqual(["episode_label", "unlinked_output", "idea_without_output"]);

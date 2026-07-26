@@ -36,6 +36,7 @@ import {
   type AnalysisExportOptions,
 } from "../../analysis-pack/src/index.ts";
 import { buildReviewItems } from "../../review/src/index.ts";
+import { buildInsights, type InsightMetrics } from "../../insights/src/index.ts";
 
 export interface IngestionReport {
   received: number;
@@ -704,6 +705,25 @@ export class ActivityStore {
     const previous = this.getRangeSummary(previousFrom, range.dates.length, timeZone, { mode: "custom", to: previousTo });
     const latestEventAt = this.getLastObservedEventAt();
     const reviewItems = buildReviewItems({ episodes, annotations, outputs, ideas });
+    const currentMetrics = current.metrics as InsightMetrics;
+    const previousMetrics = previous.metrics as InsightMetrics;
+    const insights = buildInsights({
+      period: { from: range.from, to: range.to, timeZone },
+      current: { from: range.from, to: range.to, timeZone, days: range.dates.length, metrics: currentMetrics, daysWithActivity: daily.filter((day) => day.intervals.length > 0).length },
+      previous: { from: previousFrom, to: previousTo, timeZone, days: range.dates.length, metrics: previousMetrics, daysWithActivity: (previous.daily as Array<{ activeDurationMs: number }>).filter((day) => day.activeDurationMs > 0).length },
+      episodes,
+      intervals: uniqueById(daily.flatMap((day) => day.intervals), (interval) => interval.intervalId),
+      focusPeriods: uniqueById(daily.flatMap((day) => day.focusPeriods), (period) => period.focusPeriodId),
+      outputs,
+      ideas,
+      annotations,
+      coverage: {
+        observedDays: range.dates.length,
+        daysWithActivity: daily.filter((day) => day.intervals.length > 0).length,
+        intervalCount: new Set(daily.flatMap((day) => day.intervals.map((interval) => interval.intervalId))).size,
+        lastObservedEventAt: latestEventAt,
+      },
+    });
     return {
       period: { mode: range.mode, from: range.from, to: range.to, timeZone: range.timeZone, days: range.dates.length },
       coverage: {
@@ -717,6 +737,7 @@ export class ActivityStore {
       summary: current,
       previousSummary: previous,
       reviewItems,
+      insights,
       recentIdeas: ideas.slice(-8).reverse(),
       recentOutputs: outputs.slice(-8).reverse(),
       resumeCandidates: episodes.filter((episode) => episode.ideaCount > 0 && episode.outputCount === 0).slice(-8).reverse().map((episode) => ({
@@ -727,6 +748,16 @@ export class ActivityStore {
         reason: "Contains an explicit idea and no linked output.",
       })),
     };
+  }
+
+  getInsights(
+    from: string,
+    days: number,
+    timeZone = "UTC",
+    options: { mode?: CalendarRangeMode; to?: string } = {},
+  ): Record<string, unknown> {
+    const overview = this.getOverview(from, days, timeZone, options);
+    return { period: overview.period, coverage: overview.coverage, insights: overview.insights };
   }
 
   getHistoricalSummary(timeZone = "UTC", options: HistoricalSummaryOptions = {}): Record<string, unknown> {

@@ -119,9 +119,43 @@ function renderOverview(data: Json): void {
     metric("Historical visits", String(coverage.historicalVisits), "Separate historical evidence"),
   );
   const grid = el("section", "grid");
-  grid.append(reviewInboxCard(data.reviewItems), comparisonCard(summary, data.previousSummary, data.period), resumeCard(data.resumeCandidates), recentIdeasCard(data.recentIdeas), recentOutputsCard(data.recentOutputs));
+  grid.append(reviewInboxCard(data.reviewItems), comparisonCard(summary, data.previousSummary, data.period), insightsCard(data.insights), resumeCard(data.resumeCandidates), recentIdeasCard(data.recentIdeas), recentOutputsCard(data.recentOutputs));
   content.replaceChildren(metrics, grid);
   if (!data.reviewItems.length) showNotice("No review items were derived for this range.");
+}
+
+function insightsCard(items: Json[]): HTMLElement {
+  const card = cardShell("Deterministic observations", "Neutral signals derived from the selected evidence range. Each item states its basis and sample size.", "wide");
+  const list = scrollRegion(el("div", "insight-list"), "Deterministic observations", "tall");
+  if (!items.length) list.append(empty("No deterministic observations met the current evidence thresholds."));
+  items.forEach((item: Json) => {
+    const row = el("article", "insight-item");
+    const heading = el("div", "insight-heading");
+    heading.append(el("strong", "", item.title), el("small", "", `${item.severity === "review" ? "Review" : "Information"} · ${labelText(item.basis)} · sample ${item.sampleSize}`));
+    const statement = el("p", "", item.statement);
+    const caveat = item.caveats?.[0] ? el("small", "insight-caveat", item.caveats[0]) : null;
+    const action = item.action && (item.evidenceRefs?.length || item.action.target) ? el("button", "secondary", item.action.label) : null;
+    if (action) { action.type = "button"; action.addEventListener("click", () => navigateToInsight(item)); }
+    row.append(heading, statement);
+    if (caveat) row.append(caveat);
+    if (action) row.append(action);
+    list.append(row);
+  });
+  card.append(list);
+  return card;
+}
+
+function navigateToInsight(item: Json): void {
+  const evidence = item.evidenceRefs?.[0];
+  if (evidence?.date) dateInput.value = evidence.date;
+  if (evidence?.type === "interval") pendingEvidenceTarget = { intervalId: evidence.id };
+  else if (evidence?.type === "episode") pendingEvidenceTarget = { episodeId: evidence.id };
+  else if (evidence?.type === "output") pendingEvidenceTarget = { outputId: evidence.id };
+  else if (evidence?.type === "idea") pendingEvidenceTarget = { ideaId: evidence.id };
+  else if (item.action?.target?.startsWith("ep_")) pendingEvidenceTarget = { episodeId: item.action.target };
+  view = "day";
+  updateActiveNav("day");
+  void load();
 }
 
 function renderHistory(data: Json): void {

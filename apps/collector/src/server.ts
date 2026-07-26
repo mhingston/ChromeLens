@@ -252,6 +252,19 @@ async function handleRequest(
     }
     return;
   }
+  if (request.method === "GET" && url.pathname === "/api/insights") {
+    const from = url.searchParams.get("from") ?? new Date().toISOString().slice(0, 10);
+    const days = Number(url.searchParams.get("days") ?? 7);
+    const timeZone = url.searchParams.get("timezone") ?? "UTC";
+    const to = url.searchParams.get("to") ?? undefined;
+    try {
+      const mode = parseRangeMode(url.searchParams.get("mode"));
+      json(response, 200, store.getInsights(from, days, timeZone, mode ? { mode, ...(to ? { to } : {}) } : {}));
+    } catch (error) {
+      json(response, 400, { error: "invalid_insights", message: error instanceof Error ? error.message : "Invalid insight range" });
+    }
+    return;
+  }
   if (request.method === "GET" && url.pathname === "/api/overview") {
     const from = url.searchParams.get("from") ?? new Date().toISOString().slice(0, 10);
     const days = Number(url.searchParams.get("days") ?? 7);
