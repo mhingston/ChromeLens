@@ -157,6 +157,8 @@ npm run build
 npm run verify
 ```
 
+`npm run verify` is the standard local gate for type checking, the Vitest suite, and a production build. The current suite contains 17 test files and 50 tests. On 2026-07-26, a clean Chromium smoke test against a temporary loopback collector authenticated successfully and exercised Overview review/delivery evidence, captured-idea continuity, Patterns domain evidence, the History evidence boundary, local search, and navigation between views. The smoke data and collector were isolated to a temporary directory and discarded after the run.
+
 Tests exercise public behavior with real temporary SQLite databases and Git repositories: timestamp conversion, multi-profile discovery, WAL snapshot imports, schema variation and idempotency, URL exclusions/redaction and collector self-exclusion, active-time event sequences, DST-safe calendar projection, focus periods, episode evidence, durable annotation reassociation, privacy-graded LLM exports, Git output collection/association, authenticated ingestion, deletion/rebuild, and offline delivery behavior. The final extension smoke test uses `agent-browser` against the built unpacked extension.
 
 The authenticated `/api/diagnostics/connection` endpoint verifies the bearer token, collector schema, tracking-control reachability, and canonical privacy version. Extension connection tests use the values currently in the form, including unsaved edits; they do not use the unauthenticated health route.
