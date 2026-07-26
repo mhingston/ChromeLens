@@ -19,6 +19,7 @@
     "verify": "npm run typecheck && npm test && npm run build"
   },
   "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
     "@types/chrome": "^0.2.2",
     "@types/node": "^26.1.1",
     "esbuild": "^0.28.1",

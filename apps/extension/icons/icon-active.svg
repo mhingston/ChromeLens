@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="ChromeLens tracking active">
+  <circle cx="64" cy="64" r="62" fill="#2D7D68"/>
+  <g transform="rotate(42 64 64)" fill="none" stroke="#F6F3EA" stroke-width="9" stroke-linecap="round">
+    <ellipse cx="64" cy="64" rx="40" ry="13"/>
+    <ellipse cx="64" cy="64" rx="13" ry="40"/>
+  </g>
+  <circle cx="64" cy="64" r="9" fill="#F6F3EA"/>
+</svg>

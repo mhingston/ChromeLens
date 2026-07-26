@@ -14,9 +14,21 @@
     "service_worker": "background.js",
     "type": "module"
   },
+  "icons": {
+    "16": "icons/icon-active-16.png",
+    "32": "icons/icon-active-32.png",
+    "48": "icons/icon-active-48.png",
+    "128": "icons/icon-active-128.png"
+  },
   "action": {
     "default_title": "ChromeLens",
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-active-16.png",
+      "32": "icons/icon-active-32.png",
+      "48": "icons/icon-active-48.png",
+      "128": "icons/icon-active-128.png"
+    }
   },
   "options_page": "options.html",
   "incognito": "split",

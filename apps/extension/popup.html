@@ -18,7 +18,31 @@
     </header>
 
     <section class="status-card">
-      <div id="status-pill" class="status-pill" data-state="active"><i></i><span id="status-label">Tracking active</span></div>
+      <div id="status-pill" class="status-pill" data-state="active">
+        <span class="pill-icon" aria-hidden="true">
+          <svg viewBox="0 0 32 32">
+            <g class="pill-state-active">
+              <circle cx="16" cy="16" r="15" fill="#2D7D68"/>
+              <g transform="rotate(42 16 16)" fill="none" stroke="#F6F3EA" stroke-width="2.4" stroke-linecap="round">
+                <ellipse cx="16" cy="16" rx="10" ry="3.4"/>
+                <ellipse cx="16" cy="16" rx="3.4" ry="10"/>
+              </g>
+              <circle cx="16" cy="16" r="2.4" fill="#F6F3EA"/>
+            </g>
+            <g class="pill-state-paused">
+              <circle cx="16" cy="16" r="14" fill="#F6F3EA" stroke="#9CA8A2" stroke-width="1.6"/>
+              <g transform="rotate(42 16 16)" fill="none" stroke="#9CA8A2" stroke-width="1.8" stroke-linecap="round">
+                <ellipse cx="16" cy="16" rx="8.5" ry="2.8"/>
+                <ellipse cx="16" cy="16" rx="2.8" ry="8.5"/>
+              </g>
+              <circle cx="16" cy="16" r="1.8" fill="#9CA8A2"/>
+              <line x1="9.5" y1="9.5" x2="22.5" y2="22.5" stroke="#F6F3EA" stroke-width="3.6" stroke-linecap="round"/>
+              <line x1="9.5" y1="9.5" x2="22.5" y2="22.5" stroke="#9CA8A2" stroke-width="1.6" stroke-linecap="round"/>
+            </g>
+          </svg>
+        </span>
+        <span id="status-label">Tracking active</span>
+      </div>
       <p>Only tab metadata, browser focus, and idle state. Never page content or keystrokes.</p>
       <button id="toggle-tracking" class="secondary">Pause tracking</button>
     </section>

@@ -11,6 +11,20 @@ import { getExtensionSettings, saveExtensionSettings, type ExtensionSettings } f
 
 const QUEUE_KEY = "deliveryQueue";
 const MAX_QUEUE_SIZE = 5_000;
+const ICONS = {
+  active: {
+    16: "icons/icon-active-16.png",
+    32: "icons/icon-active-32.png",
+    48: "icons/icon-active-48.png",
+    128: "icons/icon-active-128.png",
+  },
+  paused: {
+    16: "icons/icon-paused-16.png",
+    32: "icons/icon-paused-32.png",
+    48: "icons/icon-paused-48.png",
+    128: "icons/icon-paused-128.png",
+  },
+} as const;
 let mutation = Promise.resolve();
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -65,7 +79,7 @@ async function initialise(): Promise<void> {
   await chrome.idle.setDetectionInterval(60);
   await chrome.alarms.create("chromelens-delivery", { periodInMinutes: 1 });
   const session = await ensureBrowserSession();
-  await updateBadge();
+  await updateIcon();
   if (!session.startedRecorded) {
     await emit("browser_session_started", {});
     await chrome.storage.session.set({ session: { ...session, startedRecorded: true } });
@@ -173,7 +187,7 @@ async function handleMessage(message: unknown): Promise<Record<string, unknown>>
     settings.trackingEnabled = enabled;
     settings.trackingUpdatedAt = new Date().toISOString();
     await saveExtensionSettings(settings);
-    await updateBadge();
+    await updateIcon();
     if (enabled) {
       await syncRemoteControl();
       await captureCurrentContext("tracking_resumed");
@@ -219,10 +233,9 @@ async function activeTabInWindow(windowId: number): Promise<chrome.tabs.Tab | un
   return tabs[0];
 }
 
-async function updateBadge(): Promise<void> {
+async function updateIcon(): Promise<void> {
   const { trackingEnabled } = await getExtensionSettings();
-  await chrome.action.setBadgeText({ text: trackingEnabled ? "ON" : "Ⅱ" });
-  await chrome.action.setBadgeBackgroundColor({ color: trackingEnabled ? "#2D7D68" : "#B36A2E" });
+  await chrome.action.setIcon({ path: trackingEnabled ? ICONS.active : ICONS.paused });
   await chrome.action.setTitle({ title: trackingEnabled ? "ChromeLens — tracking active" : "ChromeLens — tracking paused" });
 }
 
@@ -247,7 +260,7 @@ async function syncRemoteControl(): Promise<boolean> {
       settings.trackingEnabled = remote.trackingEnabled;
       settings.trackingUpdatedAt = new Date(remote.updatedAt).toISOString();
       await saveExtensionSettings(settings);
-      await updateBadge();
+      await updateIcon();
       await captureCurrentContext(remote.trackingEnabled ? "tracking_resumed" : "tracking_paused");
     }
     return true;

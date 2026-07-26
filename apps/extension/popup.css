@@ -13,9 +13,13 @@ h1 { margin:0; font-family:Georgia,serif; font-size:25px; font-weight:500; }
 .icon-button { border:0; background:transparent; color:var(--muted); font-size:18px; cursor:pointer; padding:8px; }
 section { border:1px solid var(--line); background:rgba(255,253,248,.88); border-radius:16px; box-shadow:0 8px 24px rgba(48,62,54,.05); }
 .status-card { padding:16px; margin-bottom:12px; }
-.status-pill { display:flex; align-items:center; gap:8px; font-weight:700; font-size:13px; }
-.status-pill i { width:8px; height:8px; border-radius:50%; background:var(--green); box-shadow:0 0 0 4px var(--green-pale); }
-.status-pill[data-state="paused"] i { background:var(--orange); box-shadow:0 0 0 4px #f6e5d7; }
+.status-pill { display:flex; align-items:center; gap:9px; font-weight:700; font-size:13px; }
+.pill-icon { width:18px; height:18px; display:inline-flex; flex-shrink:0; }
+.pill-icon svg { width:100%; height:100%; display:block; }
+.pill-state-active { display:block; }
+.pill-state-paused { display:none; }
+.status-pill[data-state="paused"] .pill-state-active { display:none; }
+.status-pill[data-state="paused"] .pill-state-paused { display:block; }
 .status-card p { color:var(--muted); font-size:11px; line-height:1.55; margin:10px 0 13px; }
 button { font:inherit; }
 .secondary,.primary { width:100%; border-radius:10px; padding:10px 13px; cursor:pointer; font-size:12px; font-weight:750; }
