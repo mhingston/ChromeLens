@@ -265,6 +265,31 @@ async function handleRequest(
     }
     return;
   }
+  if (request.method === "GET" && url.pathname === "/api/search") {
+    const query = url.searchParams.get("q") ?? "";
+    const limit = Number(url.searchParams.get("limit") ?? 50);
+    const timeZone = url.searchParams.get("timezone") ?? "UTC";
+    if (query.length > 200 || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+      json(response, 400, { error: "invalid_search", message: "q must be at most 200 characters and limit must be 1-100" });
+      return;
+    }
+    try { json(response, 200, { query, timeZone, results: store.search(query, limit, timeZone, privacySettings) }); }
+    catch (error) { json(response, 400, { error: "invalid_search", message: error instanceof Error ? error.message : "Invalid search" }); }
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/patterns") {
+    const from = url.searchParams.get("from") ?? new Date().toISOString().slice(0, 10);
+    const days = Number(url.searchParams.get("days") ?? 7);
+    const timeZone = url.searchParams.get("timezone") ?? "UTC";
+    const to = url.searchParams.get("to") ?? undefined;
+    try {
+      const mode = parseRangeMode(url.searchParams.get("mode"));
+      json(response, 200, store.getPatterns(from, days, timeZone, mode ? { mode, ...(to ? { to } : {}) } : {}));
+    } catch (error) {
+      json(response, 400, { error: "invalid_patterns", message: error instanceof Error ? error.message : "Invalid patterns range" });
+    }
+    return;
+  }
   if (request.method === "GET" && url.pathname === "/api/overview") {
     const from = url.searchParams.get("from") ?? new Date().toISOString().slice(0, 10);
     const days = Number(url.searchParams.get("days") ?? 7);
@@ -510,6 +535,8 @@ function parseAnalysisExportOptions(url: URL): AnalysisExportOptions {
     throw new Error("privacy must be aggregate, contextual, or detailed");
   }
   const maxTokens = Number(url.searchParams.get("maxTokens") ?? 50_000);
+  const question = url.searchParams.get("question") ?? undefined;
+  if (question && question.length > 1_000) throw new Error("question must be at most 1000 characters");
   return {
     from: requiredQueryParameter(url, "from"),
     to: requiredQueryParameter(url, "to"),
@@ -517,6 +544,7 @@ function parseAnalysisExportOptions(url: URL): AnalysisExportOptions {
     privacy,
     format,
     maxTokens,
+    ...(question ? { question } : {}),
   };
 }
 

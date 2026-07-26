@@ -65,6 +65,25 @@ export interface InsightInput {
   coverage: InsightCoverage;
 }
 
+export interface ResumeCandidate {
+  episodeId: string;
+  date: string;
+  topicLabel: string;
+  score: number;
+  activeDurationMs: number;
+  reasons: string[];
+  evidenceRefs: InsightEvidenceRef[];
+}
+
+export interface AnnotationPattern {
+  patternId: string;
+  label: string;
+  statement: string;
+  sampleSize: number;
+  evidenceRefs: InsightEvidenceRef[];
+  caveats: string[];
+}
+
 export function buildInsights(input: InsightInput): Insight[] {
   const insights: Insight[] = [];
   const intervalById = new Map(input.intervals.map((interval) => [interval.intervalId, interval]));
@@ -150,6 +169,63 @@ export function buildInsights(input: InsightInput): Insight[] {
   }, "coverage:privacy-drift"));
 
   return insights.sort((left, right) => severityRank(left) - severityRank(right) || left.kind.localeCompare(right.kind) || left.title.localeCompare(right.title) || left.insightId.localeCompare(right.insightId));
+}
+
+export function buildResumeCandidates(
+  episodes: readonly ResearchEpisode[],
+  intervals: readonly ActiveInterval[],
+  annotations: readonly EpisodeAnnotation[],
+  limit = 8,
+): ResumeCandidate[] {
+  const intervalById = new Map(intervals.map((interval) => [interval.intervalId, interval]));
+  const pageVisits = new Map<string, Set<string>>();
+  for (const interval of intervals) {
+    const url = interval.canonicalUrl ?? interval.url;
+    if (!url) continue;
+    const days = pageVisits.get(url) ?? new Set<string>();
+    days.add(dateOf(interval.startedAt));
+    pageVisits.set(url, days);
+  }
+  return episodes.flatMap((episode) => {
+    let score = 0;
+    const reasons: string[] = [];
+    if (episode.ideaCount > 0) { score += 4; reasons.push("Contains an explicit idea"); }
+    if (episode.outputCount === 0) { score += 2; reasons.push("No linked output in the derived record"); }
+    if (episode.topicLabelSource === "user") { score += 2; reasons.push("Topic was corrected by the user"); }
+    if (annotations.some((annotation) => annotation.episodeId === episode.episodeId)) { score += 2; reasons.push("Has a user-authored annotation"); }
+    if (episode.intervalIds.some((id) => {
+      const url = intervalById.get(id)?.canonicalUrl ?? intervalById.get(id)?.url;
+      return Boolean(url && (pageVisits.get(url)?.size ?? 0) > 1);
+    })) { score += 1; reasons.push("Includes a page observed on multiple days"); }
+    if (!score) return [];
+    return [{ episodeId: episode.episodeId, date: dateOf(episode.startedAt), topicLabel: episode.topicLabel, score, activeDurationMs: episode.activeDurationMs, reasons, evidenceRefs: episode.intervalIds.map((id) => ({ type: "interval" as const, id, date: dateOf(intervalById.get(id)?.startedAt ?? episode.startedAt) })) }];
+  }).sort((left, right) => right.score - left.score || right.date.localeCompare(left.date) || left.topicLabel.localeCompare(right.topicLabel) || left.episodeId.localeCompare(right.episodeId)).slice(0, Math.max(1, limit));
+}
+
+export function buildAnnotationPatterns(episodes: readonly ResearchEpisode[], annotations: readonly EpisodeAnnotation[]): AnnotationPattern[] {
+  const episodeById = new Map(episodes.map((episode) => [episode.episodeId, episode]));
+  const grouped = new Map<string, Set<string>>();
+  for (const annotation of annotations) {
+    const episode = episodeById.get(annotation.episodeId);
+    if (!episode) continue;
+    const episodeIds = grouped.get(annotation.label) ?? new Set<string>();
+    episodeIds.add(episode.episodeId);
+    grouped.set(annotation.label, episodeIds);
+  }
+  return [...grouped.entries()].flatMap(([label, ids]) => {
+    const labelled = [...ids].map((id) => episodeById.get(id)).filter((episode): episode is ResearchEpisode => Boolean(episode));
+    if (labelled.length < 2) return [];
+    const averageSwitches = labelled.reduce((sum, episode) => sum + episode.domainSwitchCount, 0) / labelled.length;
+    const evidenceRefs = labelled.map((episode) => ({ type: "episode" as const, id: episode.episodeId, date: dateOf(episode.startedAt) }));
+    return [{
+      patternId: `annotation_${stableHash(`${label}:${labelled.map((episode) => episode.episodeId).sort().join(",")}`)}`,
+      label,
+      statement: `${labelled.length} episodes you labelled “${label}” contained an average of ${averageSwitches.toFixed(1)} observed domain transition(s).`,
+      sampleSize: labelled.length,
+      evidenceRefs,
+      caveats: ["This summarizes user-authored labels and observed transitions; it does not establish causation or compare against unlabelled records."],
+    }];
+  }).sort((left, right) => right.sampleSize - left.sampleSize || left.label.localeCompare(right.label) || left.patternId.localeCompare(right.patternId));
 }
 
 function recurringTopicInsight(input: InsightInput): Insight | null {

@@ -12,11 +12,13 @@ const tokenDialog = document.querySelector<HTMLDialogElement>("#token-dialog")!;
 const notice = document.querySelector<HTMLElement>("#notice")!;
 const evidenceDrawer = document.querySelector<HTMLDialogElement>("#evidence-drawer")!;
 const evidenceDrawerContent = document.querySelector<HTMLElement>("#evidence-drawer-content")!;
+const searchInput = document.querySelector<HTMLInputElement>("#global-search-input")!;
 const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 let token = localStorage.getItem("chromelens-token") ?? "";
 let view = "overview";
 let historyBrowser = "";
 let historyProfile = "";
+let searchQueryValue = "";
 let pendingEvidenceTarget: { intervalId?: string; episodeId?: string; outputId?: string; ideaId?: string } | null = null;
 dateInput.value = localCalendarDate(new Date());
 rangeModeInput.value = "calendar_week";
@@ -34,6 +36,7 @@ dateInput.addEventListener("change", () => void load());
 rangeModeInput.addEventListener("change", () => { syncRangeControls(); void load(); });
 customFromInput.addEventListener("change", () => void load());
 customToInput.addEventListener("change", () => void load());
+document.querySelector<HTMLFormElement>("#global-search-form")!.addEventListener("submit", (event) => { event.preventDefault(); searchQueryValue = searchInput.value.trim(); if (!searchQueryValue) return; view = "search"; updateActiveNav("search"); void load(); });
 document.querySelector("#today")!.addEventListener("click", () => { dateInput.value = localCalendarDate(new Date()); void load(); });
 document.querySelector("#close-evidence-drawer")!.addEventListener("click", () => evidenceDrawer.close());
 document.querySelector<HTMLFormElement>("#token-form")!.addEventListener("submit", () => {
@@ -44,13 +47,14 @@ document.querySelector<HTMLFormElement>("#token-form")!.addEventListener("submit
 
 async function load(): Promise<void> {
   const titles: Record<string, [string,string]> = {
-    overview:["OVERVIEW","What needs attention, and where to resume."], day:["EXPLORE / DAY","A day in context."], week:["PATTERNS / WEEK","Seven days, observed."],
+    overview:["OVERVIEW","What needs attention, and where to resume."], day:["EXPLORE / DAY","A day in context."], patterns:["PATTERNS","Recurring evidence, with its basis visible."], week:["PATTERNS / WEEK","Seven days, observed."],
+    search:["SEARCH / LOCAL EVIDENCE","Find retained records by provenance."],
     month:["MONTHLY PATTERNS","A calendar month, observed."], history:["HISTORY / IMPORTED","Browser-recorded evidence, separately labelled."], settings:["LOCAL CONTROLS","Privacy & data."],
   };
   document.querySelector("#view-kicker")!.textContent = titles[view]![0];
   document.querySelector("#view-title")!.textContent = titles[view]![1];
-  document.querySelector<HTMLElement>("#date-controls")!.hidden = view === "settings" || view === "history";
-  rangeModeInput.hidden = view === "day" || view === "settings" || view === "history";
+  document.querySelector<HTMLElement>("#date-controls")!.hidden = view === "settings" || view === "history" || view === "search";
+  rangeModeInput.hidden = view === "day" || view === "settings" || view === "history" || view === "search";
   syncRangeControls();
   content.replaceChildren(el("div", "loading", "Focusing the lens…"));
   notice.hidden = true;
@@ -59,8 +63,10 @@ async function load(): Promise<void> {
     await refreshCollectorStatus();
     if (view === "overview") renderOverview(await api(overviewQuery()));
     else if (view === "day") renderDay(await api(`/api/summary/daily?date=${dateInput.value}&timezone=${encodeURIComponent(timeZone)}`));
+    else if (view === "patterns") renderPatterns(await api(patternsQuery()));
     else if (view === "week" || view === "month") renderRange(await api(rangeQuery()));
     else if (view === "history") renderHistory(await api(historyQuery()));
+    else if (view === "search") renderSearch(await api(searchQuery()));
     else await renderSettings();
   } catch (error) {
     if (error instanceof CollectorApiError && error.status === 401) return requireToken();
@@ -104,8 +110,16 @@ function historyQuery(): string {
   return `/api/history/summary?${query.toString()}`;
 }
 
+function patternsQuery(): string {
+  const mode = rangeModeInput.value as CalendarRangeMode;
+  const range = mode === "custom" ? calendarRange(dateInput.value, timeZone, mode, customFromInput.value, customToInput.value) : calendarRange(dateInput.value, timeZone, mode);
+  return `/api/patterns?from=${range.from}&to=${range.to}&days=${range.dates.length}&mode=${mode}&timezone=${encodeURIComponent(timeZone)}`;
+}
+
+function searchQuery(): string { return `/api/search?q=${encodeURIComponent(searchQueryValue)}&limit=50&timezone=${encodeURIComponent(timeZone)}`; }
+
 function syncRangeControls(): void {
-  customRange.hidden = view === "day" || view === "settings" || view === "history" || rangeModeInput.value !== "custom";
+  customRange.hidden = view === "day" || view === "settings" || view === "history" || view === "search" || rangeModeInput.value !== "custom";
 }
 
 function renderOverview(data: Json): void {
@@ -178,6 +192,72 @@ function renderHistory(data: Json): void {
     historyImportsCard(data),
   );
   content.replaceChildren(metrics, grid);
+}
+
+function renderPatterns(data: Json): void {
+  const summary = data.summary;
+  const rangeLabel = `${summary.from} to ${summary.to} · ${summary.timeZone} · ${labelText(summary.mode)}`;
+  const metrics = el("section", "metric-grid");
+  metrics.append(
+    metric("Active foreground", duration(summary.metrics.activeDurationMs), rangeLabel),
+    metric("Tab transitions", String(summary.metrics.tabSwitchCount), "Observed transitions"),
+    metric("Domain transitions", String(summary.metrics.domainSwitchCount), "Observed transitions"),
+    metric("Unique context boundaries", String(summary.metrics.uniqueContextBoundaryCount), "Counted once per boundary"),
+  );
+  const grid = el("section", "grid");
+  grid.append(insightsCard(data.insights), annotationPatternsCard(data.annotationPatterns), resumeCard(data.resumeCandidates), timeOfDayCard(summary.activityByHour), domainsCard(summary.topDomains), topicsCard(summary.topics), revisitsCard(summary.revisitedPages));
+  content.replaceChildren(metrics, grid);
+}
+
+function annotationPatternsCard(patterns: Json[]): HTMLElement {
+  const card = cardShell("Annotation-conditioned observations", "User-authored labels are shown with sample size; unlabelled records are not treated as a comparison group.", "wide");
+  const list = scrollRegion(el("div", "annotation-pattern-list"), "Annotation-conditioned observations");
+  if (!patterns.length) list.append(empty("At least two episodes with the same user-authored label are needed."));
+  patterns.forEach((pattern: Json) => {
+    const row = el("article", "annotation-pattern");
+    row.append(el("strong", "", pattern.statement), el("small", "", `Label: ${pattern.label} · sample ${pattern.sampleSize}`), el("span", "", pattern.caveats[0] ?? ""));
+    const button = el("button", "secondary", "Open supporting episode");
+    button.type = "button";
+    button.addEventListener("click", () => navigateToInsight({ evidenceRefs: pattern.evidenceRefs }));
+    row.append(button);
+    list.append(row);
+  });
+  card.append(list);
+  return card;
+}
+
+function renderSearch(data: Json): void {
+  const card = cardShell("Local evidence search", `${data.results.length} result(s) for “${data.query}”. Search remains on this machine and preserves record provenance.`, "wide");
+  const list = scrollRegion(el("div", "search-result-list"), "Local evidence search results", "tall");
+  if (!data.results.length) list.append(empty("No retained evidence matched this query."));
+  data.results.forEach((result: Json) => {
+    const row = el("article", "search-result");
+    const button = el("button", "search-result-button");
+    button.type = "button";
+    button.append(el("strong", "", result.title), el("span", "", result.snippet));
+    button.addEventListener("click", () => navigateToSearchResult(result));
+    row.append(button, el("small", "", `${labelText(result.type)} · ${labelText(result.basis)}${result.date ? ` · ${result.date}` : ""}${result.profileId ? ` · ${result.profileId}` : ""}`));
+    list.append(row);
+  });
+  content.replaceChildren(card);
+}
+
+function navigateToSearchResult(result: Json): void {
+  if (result.type === "historical_page" || result.type === "historical_search") {
+    historyProfile = result.profileId ?? result.target ?? "";
+    view = "history";
+    updateActiveNav("history");
+    void load();
+    return;
+  }
+  if (result.date) dateInput.value = result.date;
+  if (result.type === "interval") pendingEvidenceTarget = { intervalId: result.target };
+  else if (result.type === "episode" || result.type === "annotation") pendingEvidenceTarget = { episodeId: result.target };
+  else if (result.type === "output") pendingEvidenceTarget = { outputId: result.target };
+  else if (result.type === "idea") pendingEvidenceTarget = { ideaId: result.target };
+  view = "day";
+  updateActiveNav("day");
+  void load();
 }
 
 function historyFiltersCard(data: Json): HTMLElement {
@@ -340,7 +420,7 @@ function resumeCard(candidates: Json[]): HTMLElement {
   candidates.forEach((candidate: Json) => {
     const button = el("button", "resume-item");
     button.type = "button";
-    button.append(el("strong", "", candidate.topicLabel), el("span", "", `${candidate.date} · ${duration(candidate.activeDurationMs)} · ${candidate.reason}`));
+    button.append(el("strong", "", candidate.topicLabel), el("span", "", `${candidate.date} · ${duration(candidate.activeDurationMs)} · resume score ${candidate.score}`), el("small", "", candidate.reasons.join(" · ")));
     button.addEventListener("click", () => navigateToReviewItem({ target: candidate.episodeId, date: candidate.date }));
     list.append(button);
   });
@@ -786,6 +866,13 @@ function analysisExportCard(llmSettings: Json): HTMLElement {
   const card = cardShell("LLM analysis export", "Preview the exact, range-limited payload before sharing it with a model you choose.", "llm-export");
   const message = el("p", "analysis-guidance", llmSettings.message);
   const fields = el("div", "analysis-fields");
+  const question = selectField("Question preset", [
+    ["Compare these periods", "Compare these periods"],
+    ["Find recurring research themes", "Find recurring research themes"],
+    ["Help me resume previous research", "Help me resume previous research"],
+    ["Summarise user-authored annotations", "Summarise user-authored annotations"],
+    ["Examine ideas and linked outputs", "Examine ideas and linked outputs"],
+  ], "Compare these periods");
   const from = inputField("From", "");
   from.input.type = "date";
   from.input.value = shiftCalendarDate(dateInput.value, -6);
@@ -803,7 +890,7 @@ function analysisExportCard(llmSettings: Json): HTMLElement {
   budget.input.min = "500";
   budget.input.max = "200000";
   budget.input.value = "50000";
-  fields.append(from.wrapper, to.wrapper, privacy.wrapper, format.wrapper, budget.wrapper);
+  fields.append(question.wrapper, from.wrapper, to.wrapper, privacy.wrapper, format.wrapper, budget.wrapper);
 
   const status = el("p", "analysis-status", "Aggregate mode omits titles, URL paths, idea text, output titles, and annotation notes.");
   const preview = el("textarea", "analysis-preview") as HTMLTextAreaElement;
@@ -820,6 +907,7 @@ function analysisExportCard(llmSettings: Json): HTMLElement {
   let previewedQuery = "";
 
   const query = (): string => analysisExportQuery({
+    question: question.input.value,
     from: from.input.value,
     to: to.input.value,
     privacy: privacy.input.value,
@@ -834,7 +922,7 @@ function analysisExportCard(llmSettings: Json): HTMLElement {
     preview.value = "";
     status.textContent = "Options changed. Preview the exact payload before download.";
   };
-  [from.input, to.input, privacy.input, format.input, budget.input].forEach((input) => {
+  [question.input, from.input, to.input, privacy.input, format.input, budget.input].forEach((input) => {
     input.addEventListener("input", invalidatePreview);
     input.addEventListener("change", invalidatePreview);
   });
@@ -867,10 +955,10 @@ function analysisExportCard(llmSettings: Json): HTMLElement {
 
 async function downloadExport(): Promise<void> { const response=await fetch("/api/export?format=json",{headers:{authorization:`Bearer ${token}`}});if(!response.ok)throw new CollectorApiError(response.status,"Export local data",null);const blob=await response.blob();const url=URL.createObjectURL(blob);const anchor=document.createElement("a");anchor.href=url;anchor.download=`chromelens-export-${new Date().toISOString().slice(0,10)}.json`;anchor.click();URL.revokeObjectURL(url); }
 function downloadPreviewedArtifact(artifact:Json):void{const blob=new Blob([artifact.content],{type:artifact.mediaType});const objectUrl=URL.createObjectURL(blob);const anchor=document.createElement("a");anchor.href=objectUrl;anchor.download=artifact.filename;anchor.click();URL.revokeObjectURL(objectUrl)}
-function analysisExportQuery(values:{from:string;to:string;privacy:string;format:string;maxTokens:string}):string{const query=new URLSearchParams({format:`llm-${values.format}`,from:values.from,to:values.to,timezone:timeZone,privacy:values.privacy,maxTokens:values.maxTokens});return query.toString()}
+function analysisExportQuery(values:{from:string;to:string;privacy:string;format:string;maxTokens:string;question:string}):string{const query=new URLSearchParams({format:`llm-${values.format}`,from:values.from,to:values.to,timezone:timeZone,privacy:values.privacy,maxTokens:values.maxTokens,question:values.question});return query.toString()}
 async function api(path:string,init:RequestInit={}):Promise<Json>{return requestApi(path,token,init)}
 function requireToken():void { if(!tokenDialog.open)tokenDialog.showModal();content.replaceChildren(el("div","empty","Enter the local collector token to view data.")); }
-function periodStep():number{if(view==="day")return 1;if(view==="week"||view==="overview")return rangeModeInput.value==="rolling_30"?30:rangeModeInput.value==="rolling_7"?7:rangeModeInput.value==="calendar_month"?1:7;return 1}
+function periodStep():number{if(view==="day")return 1;if(view==="week"||view==="overview"||view==="patterns")return rangeModeInput.value==="rolling_30"?30:rangeModeInput.value==="rolling_7"?7:rangeModeInput.value==="calendar_month"?1:7;return 1}
 function shiftDate(days:number):void{if(view==="month"||rangeModeInput.value==="calendar_month")dateInput.value=shiftCalendarMonth(dateInput.value,days);else dateInput.value=shiftCalendarDate(dateInput.value,days);void load()}
 function el<K extends keyof HTMLElementTagNameMap>(tag:K,className="",text=""):HTMLElementTagNameMap[K]{const node=document.createElement(tag);if(className)node.className=className;if(text)node.textContent=text;return node} function empty(text:string){return el("div","empty",text)}
 function scrollRegion<T extends HTMLElement>(node:T,label:string,size:"standard"|"tall"="standard"):T{node.classList.add("scroll-region");if(size==="tall")node.classList.add("scroll-region-tall");node.tabIndex=0;node.setAttribute("role","region");node.setAttribute("aria-label",label);return node}

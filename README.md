@@ -15,6 +15,7 @@ The governing principle is simple: **browser activity is evidence about context,
 - Collects commit metadata through a generic output-connector interface with an initial local Git connector, then associates outputs to the nearest episode inside a configurable evidence window.
 - Hosts an authenticated local Overview, Explore, daily/weekly/monthly dashboard with raw-evidence drill-down, review inbox, linked outputs, episode annotations, privacy controls, profile import, export, and deletion.
 - Provides a first-class History view for imported domains, revisited pages, search terms, local-time visit counts, browser/profile provenance, and import runs; historical visits remain visually and semantically separate from active foreground evidence.
+- Provides local cross-evidence search, deterministic Patterns and resume candidates, annotation-conditioned observations, and explicit analysis-question presets that are included in the previewed export manifest.
 - Projects UTC evidence into the dashboard's IANA time zone, clips intervals at local-day edges, and handles 23/25-hour daylight-saving days without double counting.
 - Previews and exports range-limited, token-budgeted LLM analysis packs as Markdown or JSONL with aggregate, contextual, and detailed privacy profiles.
 

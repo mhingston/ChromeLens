@@ -58,6 +58,10 @@ function operationName(path: string, method: string): string {
     "/api/connectors/git": "Collect Git outputs",
     "/api/import": "Import browser history",
     "/api/rebuild": "Rebuild derivations",
+    "/api/history/summary": "Load history evidence",
+    "/api/insights": "Load deterministic insights",
+    "/api/patterns": "Load pattern evidence",
+    "/api/search": "Search local evidence",
   };
   return labels[pathname] ?? `${method.toUpperCase()} ${pathname}`;
 }

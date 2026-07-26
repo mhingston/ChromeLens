@@ -36,7 +36,8 @@ import {
   type AnalysisExportOptions,
 } from "../../analysis-pack/src/index.ts";
 import { buildReviewItems } from "../../review/src/index.ts";
-import { buildInsights, type InsightMetrics } from "../../insights/src/index.ts";
+import { buildAnnotationPatterns, buildInsights, buildResumeCandidates, type InsightMetrics } from "../../insights/src/index.ts";
+import { searchDocuments, type SearchResult } from "../../search/src/index.ts";
 
 export interface IngestionReport {
   received: number;
@@ -707,13 +708,15 @@ export class ActivityStore {
     const reviewItems = buildReviewItems({ episodes, annotations, outputs, ideas });
     const currentMetrics = current.metrics as InsightMetrics;
     const previousMetrics = previous.metrics as InsightMetrics;
+    const insightIntervals = uniqueById(daily.flatMap((day) => day.intervals), (interval) => interval.intervalId);
+    const insightFocusPeriods = uniqueById(daily.flatMap((day) => day.focusPeriods), (period) => period.focusPeriodId);
     const insights = buildInsights({
       period: { from: range.from, to: range.to, timeZone },
       current: { from: range.from, to: range.to, timeZone, days: range.dates.length, metrics: currentMetrics, daysWithActivity: daily.filter((day) => day.intervals.length > 0).length },
       previous: { from: previousFrom, to: previousTo, timeZone, days: range.dates.length, metrics: previousMetrics, daysWithActivity: (previous.daily as Array<{ activeDurationMs: number }>).filter((day) => day.activeDurationMs > 0).length },
       episodes,
-      intervals: uniqueById(daily.flatMap((day) => day.intervals), (interval) => interval.intervalId),
-      focusPeriods: uniqueById(daily.flatMap((day) => day.focusPeriods), (period) => period.focusPeriodId),
+      intervals: insightIntervals,
+      focusPeriods: insightFocusPeriods,
       outputs,
       ideas,
       annotations,
@@ -740,13 +743,7 @@ export class ActivityStore {
       insights,
       recentIdeas: ideas.slice(-8).reverse(),
       recentOutputs: outputs.slice(-8).reverse(),
-      resumeCandidates: episodes.filter((episode) => episode.ideaCount > 0 && episode.outputCount === 0).slice(-8).reverse().map((episode) => ({
-        episodeId: episode.episodeId,
-        date: episode.startedAt.slice(0, 10),
-        topicLabel: episode.topicLabel,
-        activeDurationMs: episode.activeDurationMs,
-        reason: "Contains an explicit idea and no linked output.",
-      })),
+      resumeCandidates: buildResumeCandidates(episodes, insightIntervals, annotations),
     };
   }
 
@@ -758,6 +755,64 @@ export class ActivityStore {
   ): Record<string, unknown> {
     const overview = this.getOverview(from, days, timeZone, options);
     return { period: overview.period, coverage: overview.coverage, insights: overview.insights };
+  }
+
+  search(query: string, limit = 50, timeZone = "UTC", privacy?: PrivacySettings): SearchResult[] {
+    if (!query.trim()) return [];
+    try { new Intl.DateTimeFormat("en", { timeZone }).format(0); }
+    catch { throw new Error("Invalid IANA time zone"); }
+    const documents = [] as Array<Parameters<typeof searchDocuments>[0][number]>;
+    const intervalRows = this.database.prepare("SELECT * FROM active_intervals ORDER BY started_at").all() as Array<Record<string, unknown>>;
+    for (const row of intervalRows) {
+      const interval = rowToInterval(row);
+      documents.push({ type: "interval", id: interval.intervalId, title: interval.title ?? interval.domain ?? "Observed interval", body: [interval.title, interval.domain, interval.url, interval.canonicalUrl].filter(Boolean).join(" "), date: localDate(interval.startedAt, timeZone), basis: "observed", target: interval.intervalId });
+    }
+    const episodeRows = this.database.prepare("SELECT * FROM research_episodes ORDER BY started_at").all() as Array<Record<string, unknown>>;
+    for (const row of episodeRows) {
+      const episode = rowToEpisode(row);
+      documents.push({ type: "episode", id: episode.episodeId, title: episode.topicLabel, body: [episode.topicLabel, ...episode.evidence].join(" "), date: localDate(episode.startedAt, timeZone), basis: episode.topicLabelSource === "user" ? "user_authored" : "derived", target: episode.episodeId });
+    }
+    for (const idea of this.readIdeas()) documents.push({ type: "idea", id: idea.ideaId, title: "Captured idea", body: [idea.text, ...idea.tags].join(" "), date: localDate(idea.capturedAt, timeZone), basis: "user_authored", target: idea.ideaId });
+    for (const annotation of this.readAnnotations()) documents.push({ type: "annotation", id: annotation.annotationId, title: annotation.label, body: [annotation.label, annotation.note].filter(Boolean).join(" "), date: localDate(annotation.createdAt, timeZone), basis: "user_authored", target: annotation.episodeId });
+    for (const output of this.readOutputs()) documents.push({ type: "output", id: output.outputId, title: output.title ?? output.reference ?? "Local output", body: [output.title, output.reference, output.repository, output.outputType].filter(Boolean).join(" "), date: localDate(output.occurredAt, timeZone), basis: "association", target: output.outputId });
+
+    const historyRows = this.database.prepare("SELECT * FROM historical_urls ORDER BY last_visit_at").all() as Array<Record<string, unknown>>;
+    const visibleHistory = historyRows.filter((row) => !privacy || !isExcludedUrl(String(row.url), privacy));
+    const visibleHistoryKeys = new Set(visibleHistory.map(historyRowKey));
+    for (const row of visibleHistory) {
+      const url = privacy ? sanitizeUrlForDisplay(String(row.url), privacy) : String(row.url);
+      documents.push({ type: "historical_page", id: historyRowKey(row), title: nullableString(row.title) ?? nullableString(row.domain) ?? "Historical page", body: [row.title, row.domain, url].filter(Boolean).join(" "), date: row.last_visit_at ? localDate(String(row.last_visit_at), timeZone) : null, basis: "observed", target: String(row.source_profile_id), ...(row.source_profile_id ? { profileId: String(row.source_profile_id) } : {}) });
+    }
+    const terms = this.database.prepare("SELECT term, source_browser, source_profile_id, source_url_id FROM historical_search_terms ORDER BY term").all() as Array<Record<string, unknown>>;
+    for (const row of terms) {
+      const key = `${String(row.source_browser)}\0${String(row.source_profile_id)}\0${String(row.source_url_id)}`;
+      if (!visibleHistoryKeys.has(key)) continue;
+      documents.push({ type: "historical_search", id: key, title: String(row.term), body: String(row.term), date: null, basis: "observed", target: String(row.source_profile_id), profileId: String(row.source_profile_id) });
+    }
+    return searchDocuments(documents, query, limit);
+  }
+
+  getPatterns(
+    from: string,
+    days: number,
+    timeZone = "UTC",
+    options: { mode?: CalendarRangeMode; to?: string } = {},
+  ): Record<string, unknown> {
+    const overview = this.getOverview(from, days, timeZone, options);
+    const range = options.mode
+      ? calendarRange(from, timeZone, options.mode, options.mode === "custom" ? from : undefined, options.mode === "custom" ? options.to : undefined)
+      : calendarRange(from, timeZone, "custom", from, addCalendarDays(from, days - 1));
+    const daily = range.dates.map((date) => this.getDailySummary(date, timeZone));
+    const episodes = uniqueById(daily.flatMap((day) => day.episodes), (episode) => episode.episodeId);
+    const annotations = uniqueById(daily.flatMap((day) => day.annotations), (annotation) => annotation.annotationId);
+    return {
+      period: overview.period,
+      summary: overview.summary,
+      previousSummary: overview.previousSummary,
+      insights: overview.insights,
+      annotationPatterns: buildAnnotationPatterns(episodes, annotations),
+      resumeCandidates: overview.resumeCandidates,
+    };
   }
 
   getHistoricalSummary(timeZone = "UTC", options: HistoricalSummaryOptions = {}): Record<string, unknown> {
@@ -1286,6 +1341,10 @@ function maxIso(current: string | null, candidate: string | null): string | null
   if (!current) return candidate;
   if (!candidate) return current;
   return candidate > current ? candidate : current;
+}
+
+function localDate(value: string, timeZone: string): string {
+  return formatLocalDateTime(value, timeZone).slice(0, 10);
 }
 
 function nullableString(value: unknown): string | null {
